@@ -1,0 +1,21 @@
+# Captures may contain sensitive metadata and can be very large.
+captures/*
+!captures/.gitkeep
+*.pcap
+*.pcapng
+*.cap
+
+# Generated reports and local persistent state
+exports/*
+!exports/.gitkeep
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
