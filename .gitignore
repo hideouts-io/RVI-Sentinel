@@ -11,6 +11,10 @@ exports/*
 data/*
 !data/.gitkeep
 
+# Locally cloned upstream capture backend
+# Installed by scripts/setup_rvi_capture.py
+tools/rvi_capture/
+
 # Python
 __pycache__/
 *.py[cod]
