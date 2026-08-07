@@ -1,71 +1,73 @@
 # RVI-Sentinel
 
-**Persistent iOS Network Forensics and Packet Baseline Analysis for macOS**
+**Cross-platform iPhone/iPad packet capture and persistent network-baseline analysis**
 
-RVI-Sentinel is a defensive network-analysis toolkit for inspecting packet captures over time, with first-class support for captures from a personally owned or authorized iPhone or iPad through Apple's Remote Virtual Interface (`rvictl`). It is intentionally split into two independent layers: **capture** and **analysis**. The analyzer works with ordinary `.pcap` or `.pcapng` files and does not require an iPhone, `rvictl`, or an active `rvi0` interface.
+RVI-Sentinel is a defensive network-analysis toolkit for inspecting packet captures over time. It supports Apple's native Remote Virtual Interface (`rvictl`) workflow on macOS and integrates the upstream [`gh2o/rvi_capture`](https://github.com/gh2o/rvi_capture) project for iPhone/iPad packet capture on Linux and Windows.
 
-The guiding idea is simple:
+The project deliberately separates **capture** from **analysis**:
 
 > A packet capture shows what happened during one session. A persistent baseline shows what changed.
 
-RVI-Sentinel records previously observed endpoints and hostnames so later captures can highlight infrastructure that is new to your local investigation history.
+The analyzer works with ordinary `.pcap` and `.pcapng` files from any authorized source. An iPhone, `rvictl`, or `rvi0` is not required to use the analysis engine.
 
 ---
 
 ## Highlights
 
-- Optional Apple `rvictl` workflow for USB-connected iPhone/iPad traffic capture.
-- Analysis of existing PCAP/PCAPNG files from any authorized source.
+- macOS iPhone/iPad capture with Apple `rvictl` + `rvi0` + `tcpdump`.
+- Linux and Windows iPhone/iPad capture through [`gh2o/rvi_capture`](https://github.com/gh2o/rvi_capture).
+- PCAP and PCAPNG analysis through `tshark`.
 - IPv4 and IPv6 endpoint inventory.
-- TCP and UDP port frequency analysis.
+- TCP and UDP port-frequency analysis.
 - DNS query extraction.
 - TLS Server Name Indication (SNI) extraction when visible.
 - QUIC/HTTP/3-style traffic heuristics, including UDP/443 activity.
 - DNS-label Shannon entropy heuristic for generated or encoded-looking names.
 - Persistent first-seen / last-seen observations across captures.
 - New-vs-known endpoint, DNS, and TLS-hostname detection.
-- JSON investigation reports.
-- CSV endpoint, DNS, and TLS-SNI exports.
-- No TLS interception, certificate installation, or payload decryption required.
-- A deterministic integration test that validates the analyzer without `rvictl` or `rvi0`.
+- JSON investigation reports and CSV exports.
+- Deterministic integration test that validates analysis without live capture.
 
 ---
 
 ## Architecture
 
 ```text
-                           CAPTURE SOURCES
-
-       ordinary PCAP      tcpdump/Wireshark       iPhone / iPad
-             |                   |                     |
-             |                   |                  USB trust
-             |                   |                     |
-             |                   |                  rvictl
-             |                   |                     |
-             |                   |                    rvi0
-             +-------------------+---------------------+
-                                 |
-                                 v
-                           PCAP / PCAPNG
-                                 |
-                                 v
-                              tshark
-                                 |
-                  +--------------+--------------+
-                  |              |              |
-                  v              v              v
-             IP / ports         DNS          TLS / QUIC
-                  |              |              |
-                  +--------------+--------------+
-                                 |
-                                 v
-                            analyze.py
-                                 |
-                   +-------------+-------------+
-                   |                           |
-                   v                           v
-              Current report             Persistent state
-               JSON + CSV              findings_master.json
+                              iPhone / iPad
+                                   |
+                                   | USB
+                    +--------------+--------------+
+                    |                             |
+                  macOS                    Linux / Windows
+                    |                             |
+                 rvictl                    gh2o/rvi_capture
+                    |                             |
+                  rvi0                            |
+                    |                             |
+                 tcpdump                          |
+                    +--------------+--------------+
+                                   |
+                                   v
+                              PCAP / PCAPNG
+                                   |
+                                   v
+                                tshark
+                                   |
+                      +------------+------------+
+                      |            |            |
+                      v            v            v
+                 IP / ports       DNS       TLS / QUIC
+                      |            |            |
+                      +------------+------------+
+                                   |
+                                   v
+                              analyze.py
+                                   |
+                      +------------+------------+
+                      |                         |
+                      v                         v
+                 Current report            Persistent state
+                  JSON + CSV              findings_master.json
 ```
 
 The key design rule is:
@@ -74,84 +76,30 @@ The key design rule is:
 CAPTURE LAYER != ANALYSIS LAYER
 ```
 
-`rvictl` is one packet-acquisition method. It is **not** a dependency of the analysis engine.
-
----
-
-## Requirements
-
-### Python
-
-Python 3.9+ is recommended. RVI-Sentinel currently uses only Python's standard library.
-
-```bash
-python3 --version
-```
-
-### tshark
-
-Packet decoding is performed by `tshark`, the command-line component of Wireshark.
-
-Check for it:
-
-```bash
-command -v tshark
-tshark --version
-```
-
-On macOS, Wireshark can be installed with Homebrew:
-
-```bash
-brew install --cask wireshark
-```
-
-### Optional RVI tooling
-
-Only the iPhone/iPad capture workflow requires Apple's RVI tooling.
-
-Check:
-
-```bash
-command -v rvictl
-xcrun xctrace list devices
-```
-
-`tcpdump` is included with macOS:
-
-```bash
-command -v tcpdump
-```
-
 ---
 
 ## Installation
 
-Clone the current repository into a local folder named `RVI-Sentinel`:
+Clone RVI-Sentinel:
 
 ```bash
-git clone https://github.com/hideouts-io/iOS-rvi_capture_analyzer.git RVI-Sentinel
+git clone https://github.com/hideouts-io/RVI-Sentinel.git
 cd RVI-Sentinel
 ```
 
-Ensure the entry points are executable:
-
-```bash
-chmod +x analyze.py capture_rvi.sh tests/test_analyzer.py
-```
-
-Check the CLI:
+Check the analyzer:
 
 ```bash
 python3 analyze.py --help
 ```
 
+RVI-Sentinel currently uses Python's standard library. Packet decoding requires `tshark`, the command-line component of Wireshark.
+
 ---
 
-## Analyze a PCAP without RVI
+# Analyze an existing capture
 
-You do not need an iPhone to use RVI-Sentinel.
-
-Given an existing capture:
+Given:
 
 ```text
 capture.pcapng
@@ -163,11 +111,10 @@ run:
 python3 analyze.py capture.pcapng
 ```
 
-RVI-Sentinel writes a persistent baseline and investigation outputs:
+Outputs are written to:
 
 ```text
-data/
-└── findings_master.json
+data/findings_master.json
 
 exports/
 ├── capture_report.json
@@ -176,13 +123,7 @@ exports/
 └── capture_tls_sni.csv
 ```
 
-Increase terminal output:
-
-```bash
-python3 analyze.py capture.pcapng --top 50
-```
-
-Use a separate baseline for a particular device, experiment, or investigation:
+Use a dedicated baseline for one device or investigation:
 
 ```bash
 python3 analyze.py capture.pcapng \
@@ -190,31 +131,25 @@ python3 analyze.py capture.pcapng \
   --export-dir exports/iphone
 ```
 
-Compatible input files can come from Wireshark, `tcpdump`, `dumpcap`, an RVI session, a VM lab, or another authorized capture source supported by `tshark`.
-
 ---
 
-## iPhone/iPad capture with Apple RVI
+# macOS: capture iPhone/iPad traffic with Apple RVI
 
-### 1. Connect the device
+Connect and trust the iPhone/iPad over USB.
 
-Connect your personally owned or otherwise authorized iPhone/iPad to the Mac over USB and accept the trust prompt if necessary.
-
-### 2. Find the UDID
+Find its UDID:
 
 ```bash
 xcrun xctrace list devices
 ```
 
-### 3. Start RVI
-
-Using the helper:
+Start RVI:
 
 ```bash
 ./capture_rvi.sh start <UDID>
 ```
 
-Or directly:
+or directly:
 
 ```bash
 rvictl -s <UDID>
@@ -226,88 +161,251 @@ A virtual interface such as `rvi0` should appear:
 ifconfig rvi0
 ```
 
-### 4. Capture traffic
-
-Using RVI-Sentinel:
+Capture:
 
 ```bash
 ./capture_rvi.sh capture captures/ios_capture.pcapng
 ```
 
-Equivalent manual capture:
+Equivalent manual command:
 
 ```bash
 sudo tcpdump -i rvi0 -n -s 0 -U \
   -w captures/ios_capture.pcapng
 ```
 
-Use the device normally while the capture is active. Press `Ctrl-C` when finished.
-
-### 5. Analyze
+Analyze:
 
 ```bash
 python3 analyze.py captures/ios_capture.pcapng
 ```
 
-### 6. Stop RVI
+Stop RVI:
 
 ```bash
 ./capture_rvi.sh stop <UDID>
 ```
 
-or:
+---
+
+# Linux and Windows: capture with `gh2o/rvi_capture`
+
+RVI-Sentinel integrates the open-source project:
+
+**https://github.com/gh2o/rvi_capture**
+
+The upstream project describes itself as **`rvictl for Linux and Windows`** and creates packet-capture dumps from connected iOS devices. It supports both PCAP and PCAPNG, optional UDID selection, file/FIFO output, stdout streaming, and direct Wireshark streaming.
+
+RVI-Sentinel does **not** copy the upstream Python implementation into this repository. Instead, the setup helper clones the canonical source directly so provenance remains clear.
+
+Install the upstream capture backend locally:
 
 ```bash
-rvictl -x <UDID>
+python3 scripts/setup_rvi_capture.py
+```
+
+It is placed at:
+
+```text
+tools/rvi_capture/
+```
+
+That directory is intentionally ignored by Git.
+
+Update the upstream checkout later with:
+
+```bash
+python3 scripts/setup_rvi_capture.py --update
+```
+
+The setup helper prints the exact upstream commit SHA so you can record which capture implementation produced a packet trace.
+
+See [`SOURCES.md`](SOURCES.md) for attribution and provenance details.
+
+---
+
+## Linux prerequisites
+
+Upstream documents the following requirements:
+
+- Python 3
+- `libimobiledevice`
+- `usbmuxd` running
+
+On Debian/Ubuntu-derived systems, a typical starting point is:
+
+```bash
+sudo apt update
+sudo apt install python3 libimobiledevice-utils usbmuxd
+```
+
+Confirm that the connected device is visible:
+
+```bash
+idevice_id -l
+```
+
+Install the upstream backend:
+
+```bash
+python3 scripts/setup_rvi_capture.py
+```
+
+Capture an iPhone/iPad to PCAPNG:
+
+```bash
+python3 capture_mobile.py \
+  captures/iphone_linux.pcapng
+```
+
+Select a particular device:
+
+```bash
+python3 capture_mobile.py \
+  --udid <IPHONE_UDID> \
+  captures/iphone_linux.pcapng
+```
+
+Capture and immediately analyze:
+
+```bash
+python3 capture_mobile.py \
+  --analyze \
+  captures/iphone_linux.pcapng
 ```
 
 ---
 
-## Persistent baselining
+## Windows prerequisites
 
-The default state database is JSON:
+Upstream documents the following requirements:
+
+- Python 3
+- iTunes / Apple mobile-device components
+- `AppleMobileDeviceService.exe` running
+
+The upstream project states that its required `libimobiledevice` components are downloaded as needed on Windows.
+
+From PowerShell:
+
+```powershell
+python scripts\setup_rvi_capture.py
+```
+
+Capture:
+
+```powershell
+python capture_mobile.py `
+  captures\iphone_windows.pcapng
+```
+
+Specify the UDID:
+
+```powershell
+python capture_mobile.py `
+  --udid <IPHONE_UDID> `
+  captures\iphone_windows.pcapng
+```
+
+Capture and analyze in one workflow:
+
+```powershell
+python capture_mobile.py `
+  --analyze `
+  captures\iphone_windows.pcapng
+```
+
+---
+
+## Direct upstream usage
+
+After running the setup helper, you can invoke upstream `rvi_capture.py` directly.
+
+Linux:
+
+```bash
+python3 tools/rvi_capture/rvi_capture.py \
+  --format pcapng \
+  --udid <IPHONE_UDID> \
+  captures/iphone.pcapng
+```
+
+Windows PowerShell:
+
+```powershell
+python tools\rvi_capture\rvi_capture.py `
+  --format pcapng `
+  --udid <IPHONE_UDID> `
+  captures\iphone.pcapng
+```
+
+If `--udid` is omitted, upstream selects the first device it finds.
+
+Then analyze normally:
+
+```bash
+python3 analyze.py captures/iphone.pcapng
+```
+
+---
+
+## Stream directly into Wireshark
+
+The upstream project can write capture data to stdout:
+
+```bash
+./tools/rvi_capture/rvi_capture.py - | wireshark -k -i -
+```
+
+For RVI-Sentinel investigations, saving a PCAPNG first is often preferable because it creates a repeatable evidence artifact that can be re-analyzed later.
+
+---
+
+## iOS interface metadata
+
+PCAPNG can retain interface metadata. The upstream `rvi_capture` documentation discusses iOS interfaces such as:
+
+```text
+en0       Wi-Fi
+pdp_ip0   cellular
+ipsec1    IPSec outer transport observed for VoLTE
+ipsec3    IPSec inner transport observed for VoLTE
+```
+
+In Wireshark, inspect:
+
+```text
+frame.interface_name
+```
+
+This can help distinguish traffic paths when the capture includes the relevant metadata.
+
+---
+
+## Cross-platform capture matrix
+
+| Host OS | iPhone/iPad capture backend | Output | RVI-Sentinel analysis |
+|---|---|---|---|
+| macOS | Apple `rvictl` + `tcpdump` | PCAP/PCAPNG | Yes |
+| Linux | `gh2o/rvi_capture` + `libimobiledevice`/`usbmuxd` | PCAP/PCAPNG | Yes |
+| Windows | `gh2o/rvi_capture` + Apple mobile-device services | PCAP/PCAPNG | Yes |
+| Any analysis host | Existing authorized PCAP/PCAPNG | PCAP/PCAPNG | Yes |
+
+---
+
+# Persistent baselining
+
+The default state database is:
 
 ```text
 data/findings_master.json
 ```
 
-For each observed endpoint, DNS name, or visible TLS SNI value, RVI-Sentinel records data such as:
+For observed endpoints, DNS names, and visible TLS SNI values, RVI-Sentinel records historical context including first seen, last seen, observation counts, capture membership, and recent capture counts.
 
-- first seen
-- last seen
-- observation count
-- captures in which the item appeared
-- most recent capture counts
+This allows a later capture to distinguish previously observed infrastructure from newly observed infrastructure.
 
-Suppose capture one contains:
-
-```text
-17.57.144.10
-1.1.1.1
-gateway.icloud.com
-```
-
-After that baseline exists, a later capture containing:
-
-```text
-17.57.144.10
-1.1.1.1
-34.120.55.20
-gateway.icloud.com
-new.example.net
-```
-
-can surface:
-
-```text
-NEW ENDPOINT
-34.120.55.20
-
-NEW DNS NAME
-new.example.net
-```
-
-This does not imply maliciousness. It tells the analyst where the capture differs from previous observations.
+A new endpoint or hostname is **not automatically suspicious**. It is simply a change worth contextualizing.
 
 ---
 
@@ -330,59 +428,29 @@ tls.handshake.extensions_server_name
 _ws.col.Protocol
 ```
 
-These fields are then converted into summary statistics, persistent observations, and export files.
-
----
-
-## QUIC detection
-
-Modern iOS applications frequently use QUIC and HTTP/3. RVI-Sentinel currently uses a deliberately simple heuristic: packets are treated as QUIC-like when Wireshark classifies them as QUIC or when they use UDP port 443.
-
-That is useful for traffic summarization, but it should not be treated as a definitive application classification.
-
----
-
-## DNS entropy heuristic
-
-RVI-Sentinel calculates Shannon entropy for the longest label in each observed DNS query. Long labels with relatively high entropy are added to the report as investigation leads.
-
-Examples of things that may legitimately produce high-entropy labels include CDNs, telemetry services, anti-abuse systems, cloud-generated identifiers, tracking systems, and signed or tokenized URLs.
-
-High entropy is therefore **not proof of DNS tunneling or compromise**. It is a prioritization signal for manual review.
-
 ---
 
 ## Encryption limitations
 
-RVI packet visibility does not defeat modern transport or application encryption.
+RVI packet visibility does not defeat TLS, QUIC, VPN encryption, iCloud Private Relay, encrypted DNS, ECH, or application-layer encryption.
 
-An analyst may still observe metadata such as source/destination addresses, ports, packet size, packet timing, connection frequency, unencrypted DNS, visible TLS SNI, and protocol classification while encrypted application content remains unavailable.
+You may still observe useful metadata such as source/destination addresses, ports, timing, traffic volume, unencrypted DNS, visible TLS SNI, and protocol classifications.
 
-Visibility can also be reduced by technologies including TLS 1.3, Encrypted Client Hello (ECH), encrypted DNS, QUIC, VPNs, iCloud Private Relay, and application-specific encryption.
-
-RVI-Sentinel intentionally does not attempt to bypass TLS, device security controls, or application encryption.
+RVI-Sentinel does not attempt to bypass device security controls or decrypt protected application content.
 
 ---
 
-## Testing without `rvi0`
+## Testing without live capture
 
-The repository includes a deterministic integration-style test:
-
-```text
-tests/test_analyzer.py
-```
-
-Run it with:
+Run:
 
 ```bash
 python3 tests/test_analyzer.py
 ```
 
-The test does **not** connect to an iPhone, invoke `rvictl`, create `rvi0`, or capture live network traffic. Instead it creates a controlled fake `tshark` executable that supplies known packet-field output. That isolates and validates the analysis layer.
+The test does not connect to an iPhone, invoke `rvictl`, create `rvi0`, or capture live traffic. It supplies deterministic fake `tshark` field output and validates the analysis layer independently.
 
-The test checks packet-field parsing, IPv4 endpoint tracking, DNS extraction, TLS SNI extraction, QUIC-like classification, DNS entropy heuristics, JSON/CSV exports, persistent baseline creation, and second-run known/new differentiation.
-
-Expected completion:
+Expected completion includes:
 
 ```text
 PASS: analyzer works without rvictl/rvi0
@@ -395,7 +463,11 @@ PASS: analyzer works without rvictl/rvi0
 ```text
 RVI-Sentinel/
 ├── analyze.py
-├── capture_rvi.sh
+├── capture_rvi.sh             # macOS rvictl/rvi0 capture
+├── capture_mobile.py          # Linux/Windows frontend
+├── scripts/
+│   └── setup_rvi_capture.py   # fetch canonical gh2o/rvi_capture source
+├── SOURCES.md                 # upstream provenance/attribution
 ├── README.md
 ├── requirements.txt
 ├── LICENSE
@@ -403,69 +475,32 @@ RVI-Sentinel/
 ├── tests/
 │   └── test_analyzer.py
 ├── captures/
-│   └── .gitkeep
 ├── data/
-│   └── .gitkeep
-└── exports/
-    └── .gitkeep
+├── exports/
+└── tools/
+    └── rvi_capture/           # local upstream clone; intentionally ignored
 ```
 
 ---
 
-## Privacy and evidence handling
+## Privacy and responsible use
 
-PCAP files can contain sensitive network metadata even when payloads are encrypted. Captures may reveal hostnames, IP addresses, local addressing, connection timing, traffic volume, and service usage.
+Packet captures can reveal sensitive metadata even when payloads are encrypted. The repository ignores PCAP files, generated reports, local baselines, and the local upstream checkout by default.
 
-The default `.gitignore` excludes real captures, generated exports, and local baseline state. Do not commit real captures to a public repository unless you have intentionally reviewed and sanitized them.
-
----
-
-## Troubleshooting
-
-### `tshark was not found`
-
-Install Wireshark and check:
-
-```bash
-command -v tshark
-```
-
-### `rvictl: command not found`
-
-RVI availability depends on the Apple development/device tooling installed on the Mac. RVI is optional when analyzing an existing capture.
-
-### No `rvi0` interface
-
-Check device visibility:
-
-```bash
-xcrun xctrace list devices
-```
-
-Confirm the device is connected, trusted, and recognized before running `rvictl -s <UDID>`.
-
-### DNS report is empty
-
-Possible explanations include cached resolution, encrypted DNS, VPN use, Private Relay, direct-IP communication, or a capture that did not contain DNS requests.
-
-### TLS SNI is missing
-
-Modern TLS privacy features, particularly ECH, can reduce exposed hostname information.
+Use RVI-Sentinel only with devices, networks, and packet captures you own or are explicitly authorized to inspect.
 
 ---
 
-## Roadmap
+## Upstream source
 
-Potential future development areas include SQLite-backed persistent state, capture-to-capture diff reports, ASN/GeoIP enrichment, Apple infrastructure classification, iCloud Private Relay indicators, richer QUIC analysis, connection-flow reconstruction, HTML reports, dashboard mode, Wireshark display-filter helpers, synthetic PCAP fixtures for CI, GitHub Actions tests, and optional Zeek integration.
+Linux/Windows iOS capture functionality is provided by the separately maintained upstream project:
 
----
+https://github.com/gh2o/rvi_capture
 
-## Responsible use
-
-Use RVI-Sentinel only with devices, networks, and packet captures you own or are explicitly authorized to inspect. Appropriate uses include personal iPhone/iPad diagnostics, defensive security testing, application troubleshooting, protocol research, lab exercises, incident investigation on authorized systems, and packet-analysis education.
+RVI-Sentinel's integration code does not claim authorship of that implementation. See [`SOURCES.md`](SOURCES.md).
 
 ---
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+RVI-Sentinel's own project code is MIT licensed. See [`LICENSE`](LICENSE). Upstream dependencies retain their own copyright and licensing status.
