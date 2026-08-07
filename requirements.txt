@@ -1,0 +1,2 @@
+# No Python packages are required.
+# Runtime dependency: tshark (installed with Wireshark).
