@@ -1,6 +1,41 @@
 # RVI-Sentinel
 
-**Cross-platform iPhone/iPad packet capture and persistent network-baseline analysis**
+### Cross-platform iPhone/iPad packet capture and persistent network-baseline analysis
+
+![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-000000?logo=apple&logoColor=white)
+![Capture](https://img.shields.io/badge/capture-PCAP%20%7C%20PCAPNG-0969da)
+![Analysis](https://img.shields.io/badge/analysis-tshark%20%2B%20persistent%20baseline-8250df)
+![Test](https://img.shields.io/badge/analyzer-test%20passing-1a7f37)
+![License](https://img.shields.io/badge/license-MIT-2da44e)
+
+> **Scope:** RVI-Sentinel is a defensive, cross-platform toolkit for authorized iPhone/iPad packet capture and persistent network-baseline analysis. It combines Apple's native Remote Virtual Interface workflow on macOS with the upstream `gh2o/rvi_capture` backend on Linux and Windows, while keeping capture and analysis independent.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Executive Summary](#executive-summary)
+- [Overall Architecture](#overall-architecture)
+- [Verified Analyzer Screenshot](#verified-analyzer-screenshot)
+- [Installation](#installation)
+- [Analyze an Existing Capture](#analyze-an-existing-capture)
+- [macOS Capture with Apple RVI](#macos-capture-with-apple-rvi)
+- [Linux and Windows Capture](#linux-and-windows-capture)
+- [Persistent Baselining](#persistent-baselining)
+- [Current Analysis Fields](#current-analysis-fields)
+- [Encryption Limitations](#encryption-limitations)
+- [Testing Without Live Capture](#testing-without-live-capture)
+- [Repository Structure](#repository-structure)
+- [Privacy and Responsible Use](#privacy-and-responsible-use)
+- [Evidence and Provenance](#evidence-and-provenance)
+- [Conclusions](#conclusions)
+- [Upstream Source](#upstream-source)
+- [License](#license)
+
+---
+
+## Overview
 
 RVI-Sentinel is a defensive network-analysis toolkit for inspecting packet captures over time. It supports Apple's native Remote Virtual Interface (`rvictl`) workflow on macOS and integrates the upstream [`gh2o/rvi_capture`](https://github.com/gh2o/rvi_capture) project for iPhone/iPad packet capture on Linux and Windows.
 
@@ -12,7 +47,7 @@ The analyzer works with ordinary `.pcap` and `.pcapng` files from any authorized
 
 ---
 
-## Highlights
+## Executive Summary
 
 - macOS iPhone/iPad capture with Apple `rvictl` + `rvi0` + `tcpdump`.
 - Linux and Windows iPhone/iPad capture through [`gh2o/rvi_capture`](https://github.com/gh2o/rvi_capture).
@@ -28,9 +63,50 @@ The analyzer works with ordinary `.pcap` and `.pcapng` files from any authorized
 - JSON investigation reports and CSV exports.
 - Deterministic integration test that validates analysis without live capture.
 
+### Direct capability vs. interpretation
+
+| Type | Finding |
+|---|---|
+| **Direct capability** | `capture_rvi.sh` drives Apple's `rvictl` / `rvi0` / `tcpdump` workflow on macOS. |
+| **Direct capability** | `capture_mobile.py` integrates the separately fetched `gh2o/rvi_capture` backend for Linux and Windows. |
+| **Direct capability** | `analyze.py` accepts authorized PCAP or PCAPNG input and produces persistent JSON plus CSV findings. |
+| **Direct verification** | The deterministic analyzer integration test passes without an iPhone, `rvictl`, or `rvi0`. |
+| **Interpretation boundary** | A newly observed endpoint or hostname is a baseline change, not proof of malicious activity. |
+| **Visibility boundary** | Packet metadata does not defeat TLS, QUIC, VPNs, Private Relay, encrypted DNS, ECH, or application-layer encryption. |
+
 ---
 
-## Architecture
+## Overall Architecture
+
+```mermaid
+flowchart TB
+    Device[iPhone / iPad]
+
+    subgraph Hosts[Authorized capture host]
+        Mac[macOS<br/>rvictl + rvi0 + tcpdump]
+        Cross[Linux / Windows<br/>gh2o/rvi_capture]
+    end
+
+    Capture[PCAP / PCAPNG evidence]
+    Tshark[tshark field extraction]
+    Analyzer[analyze.py]
+    Metadata[IP / ports / DNS / TLS SNI / QUIC heuristics]
+    Report[Current JSON + CSV reports]
+    Baseline[Persistent findings_master.json baseline]
+
+    Device -->|USB| Mac
+    Device -->|USB| Cross
+    Mac --> Capture
+    Cross --> Capture
+    Capture --> Tshark --> Analyzer --> Metadata
+    Metadata --> Report
+    Metadata --> Baseline
+```
+
+The two capture paths converge on the same host-independent analysis pipeline.
+
+<details>
+<summary>Text-only architecture</summary>
 
 ```text
                               iPhone / iPad
@@ -70,11 +146,21 @@ The analyzer works with ordinary `.pcap` and `.pcapng` files from any authorized
                   JSON + CSV              findings_master.json
 ```
 
+</details>
+
 The key design rule is:
 
 ```text
 CAPTURE LAYER != ANALYSIS LAYER
 ```
+
+---
+
+## Verified Analyzer Screenshot
+
+![RVI-Sentinel deterministic analyzer test](evidence/rvi-sentinel-analyzer-test.png)
+
+The screenshot records the repository's deterministic analyzer integration test. It verifies packet-field parsing, IPv4 endpoint tracking, DNS and TLS SNI extraction, QUIC-like classification, DNS entropy handling, JSON/CSV exports, persistent baselining, and known/new differentiation without requiring live device capture.
 
 ---
 
@@ -97,7 +183,7 @@ RVI-Sentinel currently uses Python's standard library. Packet decoding requires 
 
 ---
 
-# Analyze an existing capture
+## Analyze an Existing Capture
 
 Given:
 
@@ -133,7 +219,7 @@ python3 analyze.py capture.pcapng \
 
 ---
 
-# macOS: capture iPhone/iPad traffic with Apple RVI
+## macOS Capture with Apple RVI
 
 Connect and trust the iPhone/iPad over USB.
 
@@ -188,7 +274,9 @@ Stop RVI:
 
 ---
 
-# Linux and Windows: capture with `gh2o/rvi_capture`
+## Linux and Windows Capture
+
+### Capture with `gh2o/rvi_capture`
 
 RVI-Sentinel integrates the open-source project:
 
@@ -393,7 +481,7 @@ This can help distinguish traffic paths when the capture includes the relevant m
 
 ---
 
-# Persistent baselining
+## Persistent Baselining
 
 The default state database is:
 
@@ -467,6 +555,8 @@ RVI-Sentinel/
 ├── capture_mobile.py          # Linux/Windows frontend
 ├── scripts/
 │   └── setup_rvi_capture.py   # fetch canonical gh2o/rvi_capture source
+├── evidence/
+│   └── rvi-sentinel-analyzer-test.png
 ├── SOURCES.md                 # upstream provenance/attribution
 ├── README.md
 ├── requirements.txt
@@ -491,7 +581,41 @@ Use RVI-Sentinel only with devices, networks, and packet captures you own or are
 
 ---
 
-## Upstream source
+## Evidence and Provenance
+
+This repository keeps capture provenance, analysis output, and interpretation separate:
+
+| Layer | Evidence or record |
+|---|---|
+| **Capture implementation** | macOS uses Apple `rvictl` and `tcpdump`; Linux and Windows use a separately cloned canonical `gh2o/rvi_capture` checkout. |
+| **Backend provenance** | `scripts/setup_rvi_capture.py` prints the exact upstream commit SHA after installation. |
+| **Packet evidence** | PCAP or PCAPNG files remain independent inputs that can be retained and re-analyzed. |
+| **Current findings** | JSON and CSV exports describe the supplied capture. |
+| **Historical context** | The persistent baseline records first seen, last seen, counts, and capture membership. |
+| **Verification evidence** | `tests/test_analyzer.py` validates the analysis layer deterministically; the screenshot above records a passing run. |
+
+Live device capture depends on the host OS, USB trust state, and the platform-specific prerequisites documented above. The deterministic test verifies the analysis pipeline, not a live macOS, Linux, or Windows device session.
+
+For third-party attribution and redistribution boundaries, see [`SOURCES.md`](SOURCES.md).
+
+---
+
+## Conclusions
+
+RVI-Sentinel provides three host capture paths with one common analysis model:
+
+- macOS capture through Apple's native RVI tooling.
+- Linux capture through `gh2o/rvi_capture`, `libimobiledevice`, and `usbmuxd`.
+- Windows capture through `gh2o/rvi_capture` and Apple mobile-device services.
+- Host-independent analysis of existing authorized PCAP and PCAPNG evidence.
+- Persistent comparison of endpoints, DNS names, and visible TLS SNI across captures.
+- Explicit limits: baseline changes require context, and encrypted content remains protected.
+
+The central design principle is that capture produces evidence, while analysis and persistent baselining explain how that evidence differs from earlier observations.
+
+---
+
+## Upstream Source
 
 Linux/Windows iOS capture functionality is provided by the separately maintained upstream project:
 
