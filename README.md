@@ -19,6 +19,7 @@
 - [Overall Architecture](#overall-architecture)
 - [Verified Analyzer Screenshot](#verified-analyzer-screenshot)
 - [Installation](#installation)
+- [Desktop Analysis GUI](#desktop-analysis-gui)
 - [Analyze an Existing Capture](#analyze-an-existing-capture)
 - [macOS Capture with Apple RVI](#macos-capture-with-apple-rvi)
 - [Linux and Windows Capture](#linux-and-windows-capture)
@@ -89,7 +90,8 @@ flowchart TB
 
     Capture[PCAP / PCAPNG evidence]
     Tshark[tshark field extraction]
-    Analyzer[analyze.py]
+    GUI[Optional PySide6 desktop GUI]
+    Analyzer[analyze.py CLI engine]
     Metadata[IP / ports / DNS / TLS SNI / QUIC heuristics]
     Report[Current JSON + CSV reports]
     Baseline[Persistent findings_master.json baseline]
@@ -98,7 +100,9 @@ flowchart TB
     Device -->|USB| Cross
     Mac --> Capture
     Cross --> Capture
-    Capture --> Tshark --> Analyzer --> Metadata
+    Capture --> GUI --> Analyzer
+    Capture --> Analyzer
+    Analyzer --> Tshark --> Metadata
     Metadata --> Report
     Metadata --> Baseline
 ```
@@ -179,7 +183,47 @@ Check the analyzer:
 python3 analyze.py --help
 ```
 
-RVI-Sentinel currently uses Python's standard library. Packet decoding requires `tshark`, the command-line component of Wireshark.
+The CLI analyzer uses Python's standard library. Packet decoding requires `tshark`, the command-line component of Wireshark. The optional desktop GUI uses PySide6.
+
+---
+
+## Desktop Analysis GUI
+
+The first GUI release wraps the existing analyzer without replacing it. It supports:
+
+- selecting or dropping an authorized PCAP, PCAPNG, or CAP file;
+- choosing a persistent baseline and export directory;
+- configuring the DNS entropy threshold and console result count;
+- displaying the exact `analyze.py` command before execution;
+- live analyzer output and actionable process errors;
+- summary, endpoint, DNS, TLS SNI, protocol, port, and entropy-heuristic views;
+- explicit new-versus-known baseline labels;
+- opening the generated export directory.
+
+Live device capture remains in the existing platform-specific CLI workflows while the GUI capture boundary is developed and validated.
+
+Create a project-local environment and install the optional GUI dependency:
+
+```bash
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements-gui.txt
+```
+
+Use the non-hidden `venv/` directory shown above. In macOS File Provider-managed folders, a dot-prefixed environment such as `.venv/` can propagate the hidden file flag to Qt plugins and prevent the Cocoa platform plugin from being discovered.
+
+Launch the GUI:
+
+```bash
+./scripts/run_gui.sh
+```
+
+Optionally open a capture immediately:
+
+```bash
+./scripts/run_gui.sh captures/authorized-capture.pcapng
+```
+
+The GUI requires the same `tshark` runtime dependency as the CLI analyzer. It does not elevate privileges, capture live traffic, or bypass encryption.
 
 ---
 
@@ -534,9 +578,13 @@ Run:
 
 ```bash
 python3 tests/test_analyzer.py
+python3 -m tests.test_gui_models
+QT_QPA_PLATFORM=offscreen venv/bin/python -m tests.test_gui_integration
 ```
 
 The test does not connect to an iPhone, invoke `rvictl`, create `rvi0`, or capture live traffic. It supplies deterministic fake `tshark` field output and validates the analysis layer independently.
+
+The GUI integration test uses the same deterministic field stream to exercise Qt process execution, report loading, and results presentation without displaying a window or requiring live capture.
 
 Expected completion includes:
 
@@ -551,19 +599,25 @@ PASS: analyzer works without rvictl/rvi0
 ```text
 RVI-Sentinel/
 ├── analyze.py
+├── gui.py                     # optional PySide6 analysis desktop UI
+├── gui_models.py              # typed request/report validation
 ├── capture_rvi.sh             # macOS rvictl/rvi0 capture
 ├── capture_mobile.py          # Linux/Windows frontend
 ├── scripts/
+│   ├── run_gui.sh             # launch GUI from project environment
 │   └── setup_rvi_capture.py   # fetch canonical gh2o/rvi_capture source
 ├── evidence/
 │   └── rvi-sentinel-analyzer-test.png
 ├── SOURCES.md                 # upstream provenance/attribution
 ├── README.md
 ├── requirements.txt
+├── requirements-gui.txt
 ├── LICENSE
 ├── .gitignore
 ├── tests/
-│   └── test_analyzer.py
+│   ├── test_analyzer.py
+│   ├── test_gui_integration.py
+│   └── test_gui_models.py
 ├── captures/
 ├── data/
 ├── exports/

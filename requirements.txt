@@ -1,2 +1,3 @@
-# No Python packages are required.
+# The CLI analyzer has no Python package dependencies.
 # Runtime dependency: tshark (installed with Wireshark).
+# Optional desktop GUI dependencies are pinned in requirements-gui.txt.
