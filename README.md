@@ -36,6 +36,7 @@
 - [Evidence and Provenance](#evidence-and-provenance)
 - [Conclusions](#conclusions)
 - [Upstream Source](#upstream-source)
+- [Community Standards](#community-standards)
 - [License](#license)
 
 ---
@@ -649,6 +650,15 @@ RVI-Sentinel/
 │   └── setup_rvi_capture.py   # fetch canonical gh2o/rvi_capture source
 ├── evidence/
 │   └── rvi-sentinel-analyzer-test.png
+├── .github/
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── feature_request.yml
+│   │   └── config.yml
+│   └── pull_request_template.md
+├── CODE_OF_CONDUCT.md
+├── CONTRIBUTING.md
+├── SECURITY.md
 ├── SOURCES.md                 # upstream provenance/attribution
 ├── README.md
 ├── requirements.txt
@@ -720,6 +730,17 @@ Linux/Windows iOS capture functionality is provided by the separately maintained
 https://github.com/gh2o/rvi_capture
 
 RVI-Sentinel's integration code does not claim authorship of that implementation. See [`SOURCES.md`](SOURCES.md).
+
+---
+
+## Community Standards
+
+- Read the [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
+- Follow the [Contributing Guidelines](CONTRIBUTING.md) for setup, validation, privacy, and pull-request expectations.
+- Report vulnerabilities privately through the [Security Policy](SECURITY.md).
+- Use the structured GitHub issue forms for bugs and feature requests.
+
+Never publish private captures, generated reports, baseline data, endpoint inventories, device identifiers, credentials, or unsanitized investigation logs in an issue or pull request.
 
 ---
 

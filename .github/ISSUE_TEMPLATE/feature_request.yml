@@ -1,0 +1,69 @@
+name: Feature request
+description: Propose a focused defensive capture, analysis, or usability improvement.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        RVI-Sentinel accepts features for authorized defensive capture and evidence-oriented analysis. Requests to bypass device protections, intercept unauthorized traffic, or expose private investigation data are out of scope.
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I searched existing issues for a similar request.
+          required: true
+        - label: This request is for defensive use on owned or explicitly authorized devices, networks, and captures.
+          required: true
+        - label: This request does not require publishing private captures or investigation data.
+          required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - macOS capture
+        - Linux or Windows capture
+        - Analyzer
+        - Persistent baseline
+        - GUI
+        - Endpoint or port enrichment
+        - JSON or CSV export
+        - Packaging or installation
+        - Documentation
+        - New component
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Describe the concrete user need and why current behavior is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Explain the smallest useful behavior and expected output.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe existing tools or simpler approaches you considered.
+  - type: textarea
+    id: security_privacy
+    attributes:
+      label: Security and privacy impact
+      description: Identify new privileges, network calls, data retention, third-party services, or sensitive inputs. Write "None" if there are none.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Suggested validation
+      description: Explain how the feature can be tested with deterministic, synthetic, or authorized evidence.
+    validations:
+      required: true
