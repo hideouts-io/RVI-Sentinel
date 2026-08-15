@@ -95,6 +95,8 @@ def main():
         assert "www.example.com" in summary1["new_domains"]
         assert "example.apple.com" in summary1["new_tls_sni"]
         assert "ajd83jf92ksla7d.example.org" in report1["dns_entropy_findings"]
+        assert ["tcp", "443", 2] in report1["top_transport_ports"]
+        assert ["udp", "53", 3] in report1["top_transport_ports"]
 
         second = run_analyzer(env, pcap, baseline, exports)
         assert second.returncode == 0, second.stderr or second.stdout

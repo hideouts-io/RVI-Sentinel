@@ -189,7 +189,7 @@ The CLI analyzer uses Python's standard library. Packet decoding requires `tshar
 
 ## Desktop Analysis GUI
 
-The first GUI release wraps the existing analyzer without replacing it. It supports:
+The desktop GUI wraps the existing analyzer without replacing it. It supports:
 
 - selecting or dropping an authorized PCAP, PCAPNG, or CAP file;
 - choosing a persistent baseline and export directory;
@@ -197,6 +197,10 @@ The first GUI release wraps the existing analyzer without replacing it. It suppo
 - displaying the exact `analyze.py` command before execution;
 - live analyzer output and actionable process errors;
 - summary, endpoint, DNS, TLS SNI, protocol, port, and entropy-heuristic views;
+- PTR reverse-DNS names and address-scope labels for every endpoint;
+- optional local MaxMind-compatible GeoIP city/country lookup without a web API;
+- TCP/UDP-aware service labels and plain-language port explanations;
+- a report-specific Interpretation view that explains scope, caveats, and next steps;
 - explicit new-versus-known baseline labels;
 - opening the generated export directory.
 
@@ -224,6 +228,34 @@ Optionally open a capture immediately:
 ```
 
 The GUI requires the same `tshark` runtime dependency as the CLI analyzer. It does not elevate privileges, capture live traffic, or bypass encryption.
+
+### Local GeoIP setup
+
+Geolocation is deliberately local-only: RVI-Sentinel never sends captured endpoint IP addresses to a geolocation web API. To add approximate locations, download a current MaxMind-compatible City or Country `.mmdb` database, keep it outside version control (the repository's `data/` contents are ignored), and choose it in **Local GeoIP database** before analysis. MaxMind provides [GeoLite downloadable databases](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/) after account and license-key setup.
+
+IP geolocation is approximate. It often represents a network or nearby population center and must not be interpreted as the exact location of a device, person, or household. PTR hostnames are also attribution hints rather than proof: they may be absent, generic, stale, shared, or controlled by a hosting provider. Reverse-DNS resolution sends PTR queries for the observed addresses to the Mac's configured DNS resolver.
+
+### GUI screenshots
+
+These screenshots use a deterministic synthetic report and documentation-only sample values. No private capture, endpoint list, baseline, or generated report is included.
+
+#### Endpoint names, scope, and approximate location
+
+![RVI-Sentinel endpoint enrichment view](evidence/rvi-sentinel-gui-endpoints.png)
+
+The Endpoints view keeps packet counts and baseline status alongside PTR hostname hints, address scope, and optional local-only GeoIP results.
+
+#### Transport-aware port labels
+
+![RVI-Sentinel transport-aware ports view](evidence/rvi-sentinel-gui-ports.png)
+
+TCP and UDP observations remain distinct so the GUI can explain common uses such as TCP/443 HTTPS, UDP/443 QUIC/HTTP/3, UDP/53 DNS, TCP/5223 Apple Push Service, and TCP/62078 iOS lockdown. A conventional port label is context, not proof that a particular process or server was present.
+
+#### Plain-language findings interpretation
+
+![RVI-Sentinel findings interpretation view](evidence/rvi-sentinel-gui-interpretation.png)
+
+The Interpretation view explains the report-specific counts, new-versus-known baseline changes, endpoint-attribution limits, port observations, encrypted traffic, and entropy findings without turning a heuristic or newly observed value into a malicious verdict.
 
 ---
 
@@ -579,6 +611,7 @@ Run:
 ```bash
 python3 tests/test_analyzer.py
 python3 -m tests.test_gui_models
+python3 -m tests.test_finding_enrichment
 QT_QPA_PLATFORM=offscreen venv/bin/python -m tests.test_gui_integration
 ```
 
@@ -599,6 +632,8 @@ PASS: analyzer works without rvictl/rvi0
 ```text
 RVI-Sentinel/
 ├── analyze.py
+├── enrich_endpoints.py        # bounded PTR and local GeoIP enrichment process
+├── finding_enrichment.py      # address, location, and port explanations
 ├── gui.py                     # optional PySide6 analysis desktop UI
 ├── gui_models.py              # typed request/report validation
 ├── capture_rvi.sh             # macOS rvictl/rvi0 capture
@@ -616,6 +651,7 @@ RVI-Sentinel/
 ├── .gitignore
 ├── tests/
 │   ├── test_analyzer.py
+│   ├── test_finding_enrichment.py
 │   ├── test_gui_integration.py
 │   └── test_gui_models.py
 ├── captures/
@@ -630,6 +666,8 @@ RVI-Sentinel/
 ## Privacy and responsible use
 
 Packet captures can reveal sensitive metadata even when payloads are encrypted. The repository ignores PCAP files, generated reports, local baselines, and the local upstream checkout by default.
+
+Endpoint geolocation uses only the local `.mmdb` file selected by the user. RVI-Sentinel does not send captures, reports, DNS names, SNI values, or endpoint lists to a geolocation web API. PTR hostname resolution does query the Mac's configured DNS resolver for each observed endpoint.
 
 Use RVI-Sentinel only with devices, networks, and packet captures you own or are explicitly authorized to inspect.
 

@@ -36,6 +36,13 @@ class RankedFinding:
 
 
 @dataclass(frozen=True)
+class PortFinding:
+    transport: str
+    port: int
+    count: int
+
+
+@dataclass(frozen=True)
 class EntropyFinding:
     domain: str
     max_label: str
@@ -72,7 +79,7 @@ class AnalysisReport:
     domains: tuple[RankedFinding, ...]
     tls_sni: tuple[RankedFinding, ...]
     protocols: tuple[RankedFinding, ...]
-    ports: tuple[RankedFinding, ...]
+    ports: tuple[PortFinding, ...]
     entropy_findings: tuple[EntropyFinding, ...]
 
 
@@ -202,9 +209,7 @@ def load_report(path: Path) -> AnalysisReport:
             "top_protocols",
             frozenset(),
         ),
-        ports=parse_ranked_findings(
-            require_field(root, "top_ports", "report"), "top_ports", frozenset()
-        ),
+        ports=parse_port_findings(root),
         entropy_findings=parse_entropy_findings(
             require_field(root, "dns_entropy_findings", "report")
         ),
@@ -287,6 +292,45 @@ def parse_ranked_findings(
             )
         )
     return tuple(findings)
+
+
+def parse_port_findings(root: Mapping[str, object]) -> tuple[PortFinding, ...]:
+    if "top_transport_ports" not in root:
+        legacy_rows = parse_ranked_findings(
+            require_field(root, "top_ports", "report"), "top_ports", frozenset()
+        )
+        return tuple(
+            PortFinding(transport="TCP/UDP", port=parse_port(row.value), count=row.count)
+            for row in legacy_rows
+        )
+
+    rows = require_list(root["top_transport_ports"], "top_transport_ports")
+    findings: list[PortFinding] = []
+    for index, row_value in enumerate(rows):
+        row = require_list(row_value, f"top_transport_ports[{index}]")
+        if len(row) != 3:
+            raise ReportValidationError(
+                f"top_transport_ports[{index}] must contain exactly three values."
+            )
+        transport = require_string(row[0], f"top_transport_ports[{index}][0]").upper()
+        if transport not in {"TCP", "UDP"}:
+            raise ReportValidationError(
+                f"top_transport_ports[{index}][0] must be TCP or UDP."
+            )
+        port = parse_port(require_string(row[1], f"top_transport_ports[{index}][1]"))
+        count = require_integer(row[2], f"top_transport_ports[{index}][2]")
+        findings.append(PortFinding(transport=transport, port=port, count=count))
+    return tuple(findings)
+
+
+def parse_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise ReportValidationError(f"Port must be a decimal integer: {value}") from error
+    if port < 0 or port > 65535:
+        raise ReportValidationError(f"Port must be between 0 and 65535: {value}")
+    return port
 
 
 def parse_entropy_findings(value: object) -> tuple[EntropyFinding, ...]:

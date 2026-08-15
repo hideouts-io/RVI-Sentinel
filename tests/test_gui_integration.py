@@ -9,7 +9,7 @@ from pathlib import Path
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QProcess, QTimer
 from PySide6.QtWidgets import QApplication
 
 from gui import RviSentinelWindow
@@ -61,12 +61,47 @@ def main() -> None:
 
             assert timed_out is False, "GUI analyzer process timed out"
             assert window.process.exitCode() == 0
+
+            if window.enrichment_process.state() != QProcess.ProcessState.NotRunning:
+                enrichment_loop = QEventLoop()
+                enrichment_timed_out = False
+
+                def handle_enrichment_timeout() -> None:
+                    nonlocal enrichment_timed_out
+                    enrichment_timed_out = True
+                    enrichment_loop.quit()
+
+                enrichment_timer = QTimer()
+                enrichment_timer.setSingleShot(True)
+                enrichment_timer.timeout.connect(handle_enrichment_timeout)
+                window.enrichment_process.finished.connect(enrichment_loop.quit)
+                enrichment_timer.start(35_000)
+                enrichment_loop.exec()
+                enrichment_timer.stop()
+                assert enrichment_timed_out is False, "GUI endpoint enrichment timed out"
+
             assert window.summary_labels["packet_count"].text() == "7"
             assert window.summary_labels["endpoints"].text() == "5 (5 new)"
             assert window.endpoints_table.rowCount() == 5
+            assert window.endpoints_table.columnCount() == 6
+            assert all(
+                window.endpoints_table.item(row, 1).text() != "Resolving…"
+                for row in range(window.endpoints_table.rowCount())
+            )
+            assert all(
+                window.endpoints_table.item(row, 2).text()
+                for row in range(window.endpoints_table.rowCount())
+            )
+            assert all(
+                window.endpoints_table.item(row, 3).text()
+                for row in range(window.endpoints_table.rowCount())
+            )
             assert window.domains_table.rowCount() == 2
             assert window.tls_table.rowCount() == 2
+            assert window.ports_table.columnCount() == 5
+            assert window.ports_table.item(0, 2).text()
             assert window.entropy_table.rowCount() == 1
+            assert "NEW means newly observed" in window.interpretation.toPlainText()
             assert "Analysis complete." in window.status_label.text()
             assert (exports / "authorized_report.json").is_file()
             assert baseline.is_file()
@@ -79,6 +114,7 @@ def main() -> None:
     print("PASS: GUI-to-analyzer process execution")
     print("PASS: generated report loading")
     print("PASS: summary and findings table population")
+    print("PASS: explanatory port and endpoint presentation")
 
 
 if __name__ == "__main__":

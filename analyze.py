@@ -129,6 +129,7 @@ def analyze(pcap: Path, baseline: dict, entropy_threshold: float) -> dict:
     sni = Counter()
     protocols = Counter()
     ports = Counter()
+    transport_ports = Counter()
     quic_like = 0
     packet_count = 0
     first_epoch = None
@@ -158,6 +159,13 @@ def analyze(pcap: Path, baseline: dict, entropy_threshold: float) -> dict:
         for p in (row["tcp.srcport"], row["tcp.dstport"], row["udp.srcport"], row["udp.dstport"]):
             if p:
                 ports[p] += 1
+
+        for p in (row["tcp.srcport"], row["tcp.dstport"]):
+            if p:
+                transport_ports[("tcp", p)] += 1
+        for p in (row["udp.srcport"], row["udp.dstport"]):
+            if p:
+                transport_ports[("udp", p)] += 1
 
         if row["udp.srcport"] == "443" or row["udp.dstport"] == "443" or "QUIC" in proto.upper():
             quic_like += 1
@@ -219,6 +227,10 @@ def analyze(pcap: Path, baseline: dict, entropy_threshold: float) -> dict:
         "top_tls_sni": sni.most_common(),
         "top_protocols": protocols.most_common(),
         "top_ports": ports.most_common(),
+        "top_transport_ports": [
+            [transport, port, count]
+            for (transport, port), count in transport_ports.most_common()
+        ],
         "dns_entropy_findings": suspicious_dns,
     }
     return report

@@ -9,7 +9,14 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
@@ -37,6 +44,7 @@ from gui_models import (
     AnalysisReport,
     AnalysisRequest,
     EntropyFinding,
+    PortFinding,
     RankedFinding,
     ReportValidationError,
     RequestValidationError,
@@ -44,9 +52,16 @@ from gui_models import (
     load_report,
     report_path_for,
 )
+from finding_enrichment import (
+    EndpointEnrichment,
+    classify_address,
+    describe_port,
+    parse_enrichment_output,
+)
 
 ROOT = Path(__file__).resolve().parent
 ANALYZER = ROOT / "analyze.py"
+ENDPOINT_ENRICHER = ROOT / "enrich_endpoints.py"
 DEFAULT_BASELINE = ROOT / "data" / "findings_master.json"
 DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
 
@@ -57,25 +72,32 @@ class RviSentinelWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.process = QProcess(self)
+        self.enrichment_process = QProcess(self)
+        self.enrichment_timer = QTimer(self)
+        self.enrichment_timer.setSingleShot(True)
+        self.enrichment_timed_out = False
         self.active_request: AnalysisRequest | None = None
+        self.active_report_path: Path | None = None
         self.summary_labels: dict[str, QLabel] = {}
 
         self.capture_field = QLineEdit()
         self.baseline_field = QLineEdit(str(DEFAULT_BASELINE))
         self.export_field = QLineEdit(str(DEFAULT_EXPORT_DIRECTORY))
+        self.geoip_field = QLineEdit()
         self.entropy_field = QDoubleSpinBox()
         self.top_field = QSpinBox()
         self.command_field = QLineEdit()
         self.status_label = QLabel("Ready to analyze an authorized capture.")
         self.console = QTextEdit()
+        self.interpretation = QTextEdit()
         self.analyze_button = QPushButton("Analyze Capture")
         self.open_exports_button = QPushButton("Open Export Folder")
 
-        self.endpoints_table = create_ranked_table(("Endpoint", "Packets", "Baseline"))
+        self.endpoints_table = create_endpoint_table()
         self.domains_table = create_ranked_table(("DNS name", "Queries", "Baseline"))
         self.tls_table = create_ranked_table(("TLS SNI", "Observations", "Baseline"))
         self.protocols_table = create_ranked_table(("Protocol", "Packets", "Baseline"))
-        self.ports_table = create_ranked_table(("Port", "Observations", "Baseline"))
+        self.ports_table = create_port_table()
         self.entropy_table = create_entropy_table()
 
         self.configure_window()
@@ -197,11 +219,20 @@ class RviSentinelWindow(QMainWindow):
         baseline_button.setObjectName("baselineBrowseButton")
         export_button = QPushButton("Choose…")
         export_button.setObjectName("exportBrowseButton")
+        geoip_button = QPushButton("Choose…")
+        geoip_button.setObjectName("geoipBrowseButton")
 
         self.capture_field.setPlaceholderText("Drop or select an authorized .pcap, .pcapng, or .cap file")
         self.capture_field.setAccessibleName("Capture file")
         self.baseline_field.setAccessibleName("Persistent baseline file")
         self.export_field.setAccessibleName("Export directory")
+        self.geoip_field.setAccessibleName("Local GeoIP database")
+        self.geoip_field.setPlaceholderText(
+            "Optional local GeoLite2/GeoIP2 City or Country .mmdb"
+        )
+        self.geoip_field.setToolTip(
+            "Local database only. RVI-Sentinel does not send endpoint IPs to a geolocation API."
+        )
 
         self.entropy_field.setRange(0.0, 8.0)
         self.entropy_field.setDecimals(2)
@@ -228,16 +259,20 @@ class RviSentinelWindow(QMainWindow):
         layout.addWidget(QLabel("Exports"), 2, 0)
         layout.addWidget(self.export_field, 2, 1)
         layout.addWidget(export_button, 2, 2)
-        layout.addWidget(QLabel("DNS entropy threshold"), 3, 0)
-        layout.addWidget(self.entropy_field, 3, 1)
-        layout.addWidget(QLabel("Console top count"), 3, 2)
-        layout.addWidget(self.top_field, 3, 3)
-        layout.addWidget(QLabel("Exact command"), 4, 0)
-        layout.addWidget(self.command_field, 4, 1, 1, 3)
+        layout.addWidget(QLabel("Local GeoIP database"), 3, 0)
+        layout.addWidget(self.geoip_field, 3, 1)
+        layout.addWidget(geoip_button, 3, 2)
+        layout.addWidget(QLabel("DNS entropy threshold"), 4, 0)
+        layout.addWidget(self.entropy_field, 4, 1)
+        layout.addWidget(QLabel("Console top count"), 4, 2)
+        layout.addWidget(self.top_field, 4, 3)
+        layout.addWidget(QLabel("Exact command"), 5, 0)
+        layout.addWidget(self.command_field, 5, 1, 1, 3)
 
         capture_button.clicked.connect(self.choose_capture)
         baseline_button.clicked.connect(self.choose_baseline)
         export_button.clicked.connect(self.choose_export_directory)
+        geoip_button.clicked.connect(self.choose_geoip_database)
         return group
 
     def create_action_row(self) -> QHBoxLayout:
@@ -269,6 +304,12 @@ class RviSentinelWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         tabs.addTab(self.create_summary_tab(), "Summary")
+        self.interpretation.setReadOnly(True)
+        self.interpretation.setAccessibleName("Findings interpretation")
+        self.interpretation.setPlainText(
+            "Analyze a capture to receive a plain-language explanation of the findings."
+        )
+        tabs.addTab(self.interpretation, "Interpretation")
         tabs.addTab(self.endpoints_table, "Endpoints")
         tabs.addTab(self.domains_table, "DNS")
         tabs.addTab(self.tls_table, "TLS SNI")
@@ -329,6 +370,7 @@ class RviSentinelWindow(QMainWindow):
         self.capture_field.textChanged.connect(self.refresh_command_preview)
         self.baseline_field.textChanged.connect(self.refresh_command_preview)
         self.export_field.textChanged.connect(self.refresh_command_preview)
+        self.geoip_field.textChanged.connect(self.refresh_command_preview)
         self.entropy_field.valueChanged.connect(self.refresh_command_preview)
         self.top_field.valueChanged.connect(self.refresh_command_preview)
 
@@ -336,6 +378,9 @@ class RviSentinelWindow(QMainWindow):
         self.process.readyReadStandardError.connect(self.read_standard_error)
         self.process.finished.connect(self.analysis_finished)
         self.process.errorOccurred.connect(self.process_error)
+        self.enrichment_process.finished.connect(self.endpoint_enrichment_finished)
+        self.enrichment_process.errorOccurred.connect(self.endpoint_enrichment_error)
+        self.enrichment_timer.timeout.connect(self.endpoint_enrichment_timeout)
 
     def choose_capture(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
@@ -364,6 +409,29 @@ class RviSentinelWindow(QMainWindow):
         if selected:
             self.export_field.setText(selected)
 
+    def choose_geoip_database(self) -> None:
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Select a local MaxMind GeoIP database",
+            str(ROOT / "data"),
+            "MaxMind databases (*.mmdb);;All files (*)",
+        )
+        if selected:
+            self.geoip_field.setText(selected)
+
+    def current_geoip_database(self) -> Path | None:
+        path_text = self.geoip_field.text().strip()
+        if not path_text:
+            return None
+        path = Path(path_text).expanduser().resolve()
+        if not path.is_file():
+            raise RequestValidationError(f"GeoIP database not found: {path}")
+        if path.suffix.lower() != ".mmdb":
+            raise RequestValidationError(
+                f"GeoIP database must use the .mmdb format: {path}"
+            )
+        return path
+
     def current_request(self) -> AnalysisRequest:
         capture_text = self.capture_field.text().strip()
         baseline_text = self.baseline_field.text().strip()
@@ -385,10 +453,13 @@ class RviSentinelWindow(QMainWindow):
     def refresh_command_preview(self) -> None:
         try:
             request = self.current_request()
+            self.current_geoip_database()
             arguments = analyzer_arguments(request, ANALYZER)
             command = shlex.join([sys.executable, *arguments])
         except RequestValidationError:
-            command = "Select a valid capture to preview the exact analyzer command."
+            command = (
+                "Select a valid capture and optional GeoIP database to preview the analyzer command."
+            )
         self.command_field.setText(command)
         self.command_field.setCursorPosition(0)
         self.command_field.setToolTip(command)
@@ -404,7 +475,9 @@ class RviSentinelWindow(QMainWindow):
             return
 
         self.active_request = request
+        self.cancel_endpoint_enrichment()
         self.clear_results()
+        self.active_report_path = None
         exact_command = shlex.join([sys.executable, *arguments])
         self.command_field.setText(exact_command)
         self.command_field.setCursorPosition(0)
@@ -459,8 +532,9 @@ class RviSentinelWindow(QMainWindow):
             self.show_error("Report validation failed", str(error))
             return
 
+        self.active_report_path = report_path
         self.populate_report(report)
-        self.status_label.setText(f"Analysis complete. Report: {report_path}")
+        self.start_endpoint_enrichment(report.endpoints)
         self.open_exports_button.setEnabled(True)
 
     def process_error(self, error: QProcess.ProcessError) -> None:
@@ -490,14 +564,124 @@ class RviSentinelWindow(QMainWindow):
         )
         self.summary_labels["quic"].setText(f"{summary.quic_like_packets:,}")
 
-        populate_ranked_table(self.endpoints_table, report.endpoints)
         populate_ranked_table(self.domains_table, report.domains)
         populate_ranked_table(self.tls_table, report.tls_sni)
         populate_ranked_table(self.protocols_table, report.protocols)
-        populate_ranked_table(self.ports_table, report.ports)
+        populate_port_table(self.ports_table, report.ports)
         populate_entropy_table(self.entropy_table, report.entropy_findings)
+        self.interpretation.setPlainText(build_findings_explanation(report))
+
+    def start_endpoint_enrichment(self, endpoints: tuple[RankedFinding, ...]) -> None:
+        populate_endpoint_table(self.endpoints_table, endpoints)
+        if not endpoints:
+            self.status_label.setText(self.completed_status("No endpoints to enrich."))
+            return
+
+        arguments = [str(ENDPOINT_ENRICHER)]
+        try:
+            geo_database = self.current_geoip_database()
+        except RequestValidationError as error:
+            self.endpoints_table.setSortingEnabled(True)
+            self.status_label.setText(self.completed_status("GeoIP configuration is invalid."))
+            self.show_error("Invalid GeoIP configuration", str(error))
+            return
+        if geo_database is not None:
+            arguments.extend(("--geo-db", str(geo_database)))
+        arguments.extend(finding.value for finding in endpoints)
+
+        self.enrichment_timed_out = False
+        self.enrichment_process.setWorkingDirectory(str(ROOT))
+        self.enrichment_process.setProgram(sys.executable)
+        self.enrichment_process.setArguments(arguments)
+        self.status_label.setText(
+            "Analysis complete; resolving PTR hostnames and local GeoIP locations…"
+        )
+        self.enrichment_process.start()
+        self.enrichment_timer.start(30_000)
+
+    def endpoint_enrichment_finished(
+        self, exit_code: int, exit_status: QProcess.ExitStatus
+    ) -> None:
+        self.enrichment_timer.stop()
+        if self.enrichment_timed_out:
+            self.endpoints_table.setSortingEnabled(True)
+            return
+
+        error_text = bytes(self.enrichment_process.readAllStandardError()).decode(
+            "utf-8", errors="replace"
+        ).strip()
+        if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
+            detail = error_text or f"Endpoint enrichment exited with code {exit_code}."
+            self.console.append(f"\n{detail}\n")
+            self.endpoints_table.setSortingEnabled(True)
+            self.status_label.setText(self.completed_status("Endpoint enrichment failed."))
+            self.show_error("Endpoint enrichment failed", detail)
+            return
+
+        output = bytes(self.enrichment_process.readAllStandardOutput()).decode(
+            "utf-8", errors="strict"
+        )
+        try:
+            enrichment = parse_enrichment_output(output)
+        except (UnicodeDecodeError, ValueError) as error:
+            self.endpoints_table.setSortingEnabled(True)
+            self.status_label.setText(
+                self.completed_status("Endpoint enrichment output was invalid.")
+            )
+            self.show_error("Endpoint enrichment output invalid", str(error))
+            return
+
+        try:
+            apply_endpoint_enrichment(self.endpoints_table, enrichment)
+        except ValueError as error:
+            self.endpoints_table.setSortingEnabled(True)
+            self.status_label.setText(
+                self.completed_status("Endpoint enrichment did not match the report.")
+            )
+            self.show_error("Endpoint enrichment mismatch", str(error))
+            return
+        geo_status = (
+            "Local GeoIP applied."
+            if self.geoip_field.text().strip()
+            else "GeoIP database not configured."
+        )
+        self.status_label.setText(
+            self.completed_status(f"PTR resolution complete. {geo_status}")
+        )
+
+    def endpoint_enrichment_error(self, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.Crashed or self.enrichment_timed_out:
+            return
+        self.enrichment_timer.stop()
+        self.endpoints_table.setSortingEnabled(True)
+        detail = self.enrichment_process.errorString()
+        self.console.append(f"\nEndpoint enrichment process error: {detail}\n")
+        self.status_label.setText(
+            self.completed_status("Endpoint enrichment process could not start.")
+        )
+
+    def endpoint_enrichment_timeout(self) -> None:
+        if self.enrichment_process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self.enrichment_timed_out = True
+        self.enrichment_process.kill()
+        self.endpoints_table.setSortingEnabled(True)
+        detail = "Endpoint PTR resolution exceeded 30 seconds and was stopped."
+        self.console.append(f"\n{detail}\n")
+        self.status_label.setText(self.completed_status(detail))
+
+    def cancel_endpoint_enrichment(self) -> None:
+        self.enrichment_timer.stop()
+        if self.enrichment_process.state() != QProcess.ProcessState.NotRunning:
+            self.enrichment_timed_out = True
+            self.enrichment_process.kill()
+
+    def completed_status(self, detail: str) -> str:
+        report = str(self.active_report_path) if self.active_report_path else "not available"
+        return f"Analysis complete. {detail} Report: {report}"
 
     def clear_results(self) -> None:
+        self.cancel_endpoint_enrichment()
         for label in self.summary_labels.values():
             label.setText("—")
         for table in (
@@ -509,6 +693,9 @@ class RviSentinelWindow(QMainWindow):
             self.entropy_table,
         ):
             table.setRowCount(0)
+        self.interpretation.setPlainText(
+            "Analyze a capture to receive a plain-language explanation of the findings."
+        )
         self.console.clear()
 
     def open_export_directory(self) -> None:
@@ -545,6 +732,14 @@ class RviSentinelWindow(QMainWindow):
         self.capture_field.setText(urls[0].toLocalFile())
         event.acceptProposedAction()
 
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.enrichment_timer.stop()
+        for process in (self.process, self.enrichment_process):
+            if process.state() != QProcess.ProcessState.NotRunning:
+                process.kill()
+                process.waitForFinished(1_000)
+        super().closeEvent(event)
+
 
 def create_ranked_table(headers: tuple[str, str, str]) -> QTableWidget:
     table = QTableWidget(0, 3)
@@ -556,6 +751,43 @@ def create_ranked_table(headers: tuple[str, str, str]) -> QTableWidget:
     table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
     table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    return table
+
+
+def create_endpoint_table() -> QTableWidget:
+    table = QTableWidget(0, 6)
+    table.setHorizontalHeaderLabels(
+        ("Endpoint", "Hostname (PTR)", "Network scope", "Approximate location", "Packets", "Baseline")
+    )
+    table.setAccessibleName("Endpoint findings with PTR and local GeoIP enrichment")
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+    return table
+
+
+def create_port_table() -> QTableWidget:
+    table = QTableWidget(0, 5)
+    table.setHorizontalHeaderLabels(
+        ("Transport", "Port", "Service label", "Typical use", "Field observations")
+    )
+    table.setAccessibleName("Observed ports with service explanations")
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
     return table
 
 
@@ -593,6 +825,70 @@ def populate_ranked_table(
     table.setSortingEnabled(True)
 
 
+def populate_endpoint_table(
+    table: QTableWidget, findings: tuple[RankedFinding, ...]
+) -> None:
+    table.setSortingEnabled(False)
+    table.setRowCount(len(findings))
+    for row_index, finding in enumerate(findings):
+        address_item = QTableWidgetItem(finding.value)
+        hostname_item = QTableWidgetItem("Resolving…")
+        scope_item = QTableWidgetItem(classify_address(finding.value))
+        location_item = QTableWidgetItem("Local GeoIP lookup pending…")
+        count_item = QTableWidgetItem(f"{finding.count:,}")
+        count_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        baseline_item = QTableWidgetItem("NEW" if finding.is_new else "Known")
+        baseline_item.setForeground(QColor("#fbbf24" if finding.is_new else "#3fb950"))
+        table.setItem(row_index, 0, address_item)
+        table.setItem(row_index, 1, hostname_item)
+        table.setItem(row_index, 2, scope_item)
+        table.setItem(row_index, 3, location_item)
+        table.setItem(row_index, 4, count_item)
+        table.setItem(row_index, 5, baseline_item)
+
+
+def apply_endpoint_enrichment(
+    table: QTableWidget, enrichment: tuple[EndpointEnrichment, ...]
+) -> None:
+    row_by_address = {
+        table.item(row, 0).text(): row
+        for row in range(table.rowCount())
+        if table.item(row, 0) is not None
+    }
+    if len(enrichment) != len(row_by_address):
+        raise ValueError(
+            "Endpoint enrichment count does not match the endpoint report: "
+            f"{len(enrichment)} enrichment rows for {len(row_by_address)} endpoints."
+        )
+    for finding in enrichment:
+        row = row_by_address.get(finding.address)
+        if row is None:
+            raise ValueError(
+                f"Endpoint enrichment returned an address not present in the report: {finding.address}"
+            )
+        hostname_item = QTableWidgetItem(finding.hostname)
+        hostname_item.setToolTip(finding.resolution_note)
+        table.setItem(row, 1, hostname_item)
+        table.setItem(row, 2, QTableWidgetItem(finding.scope))
+        table.setItem(row, 3, QTableWidgetItem(finding.location))
+    table.setSortingEnabled(True)
+
+
+def populate_port_table(table: QTableWidget, findings: tuple[PortFinding, ...]) -> None:
+    table.setSortingEnabled(False)
+    table.setRowCount(len(findings))
+    for row_index, finding in enumerate(findings):
+        description = describe_port(finding.transport, finding.port)
+        count_item = QTableWidgetItem(f"{finding.count:,}")
+        count_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        table.setItem(row_index, 0, QTableWidgetItem(finding.transport))
+        table.setItem(row_index, 1, QTableWidgetItem(str(finding.port)))
+        table.setItem(row_index, 2, QTableWidgetItem(description.service))
+        table.setItem(row_index, 3, QTableWidgetItem(description.purpose))
+        table.setItem(row_index, 4, count_item)
+    table.setSortingEnabled(True)
+
+
 def populate_entropy_table(
     table: QTableWidget, findings: tuple[EntropyFinding, ...]
 ) -> None:
@@ -604,6 +900,52 @@ def populate_entropy_table(
         table.setItem(row_index, 2, QTableWidgetItem(f"{finding.entropy:.3f}"))
         table.setItem(row_index, 3, QTableWidgetItem(finding.note))
     table.setSortingEnabled(True)
+
+
+def build_findings_explanation(report: AnalysisReport) -> str:
+    summary = report.summary
+    duration = format_duration(report.capture.duration_seconds)
+    new_endpoint_count = len(summary.new_endpoints)
+    new_domain_count = len(summary.new_domains)
+    new_tls_count = len(summary.new_tls_sni)
+    entropy_count = len(report.entropy_findings)
+
+    port_lines = []
+    for finding in report.ports[:8]:
+        description = describe_port(finding.transport, finding.port)
+        port_lines.append(
+            f"  • {finding.transport}/{finding.port}: {description.service} — "
+            f"{description.purpose} ({finding.count:,} source/destination field observations)"
+        )
+    ports = "\n".join(port_lines) if port_lines else "  • No TCP or UDP ports were observed."
+
+    return (
+        "WHAT THIS CAPTURE SHOWS\n"
+        f"The analyzer processed {report.capture.packet_count:,} packets across {duration}. "
+        f"It observed {summary.unique_endpoints:,} unique IP endpoints, "
+        f"{summary.unique_dns_queries:,} visible DNS names, and "
+        f"{summary.unique_tls_sni:,} visible TLS SNI hostnames.\n\n"
+        "BASELINE CHANGES\n"
+        f"{new_endpoint_count:,} endpoints, {new_domain_count:,} DNS names, and "
+        f"{new_tls_count:,} TLS SNI names were absent from the selected baseline. "
+        "NEW means newly observed relative to that baseline; it is not a malicious verdict. "
+        "Investigate unexpected changes using timing, process, signing, ownership, and destination context.\n\n"
+        "ENDPOINT NAMES AND LOCATIONS\n"
+        "The Endpoints tab adds PTR reverse-DNS names and address scope. PTR records are controlled "
+        "by network operators and may be missing, generic, stale, or shared. PTR lookup queries are "
+        "sent to the Mac's configured DNS resolver. Geolocation uses only the selected local MMDB "
+        "file; public endpoint IPs are not sent to a geolocation web API. IP location is "
+        "approximate and must not be interpreted as a precise device, person, or household location.\n\n"
+        "PORTS\n"
+        f"{ports}\n"
+        "A port label describes its conventional use, not a confirmed application or listening service. "
+        "Counts include appearances in packet source and destination fields and are not connection counts.\n\n"
+        "ENCRYPTED AND HEURISTIC SIGNALS\n"
+        f"The capture contained {summary.quic_like_packets:,} QUIC-like packets. Encryption protects "
+        "payload content, although endpoints and some handshake metadata can remain visible. "
+        f"The DNS entropy heuristic flagged {entropy_count:,} names. High entropy can also be caused "
+        "by legitimate CDNs, tracking identifiers, and generated service names, so corroboration is required."
+    )
 
 
 def format_bytes(size_bytes: int) -> str:

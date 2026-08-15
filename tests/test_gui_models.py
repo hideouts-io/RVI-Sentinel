@@ -43,6 +43,7 @@ def sample_report(capture_path: Path) -> dict[str, object]:
         "top_tls_sni": [["example.apple.com", 1]],
         "top_protocols": [["TLS", 2], ["DNS", 2]],
         "top_ports": [["443", 4], ["53", 2]],
+        "top_transport_ports": [["tcp", "443", 4], ["udp", "53", 2]],
         "dns_entropy_findings": {
             "ajd83jf92ksla7d.example.org": {
                 "max_label": "ajd83jf92ksla7d",
@@ -84,6 +85,8 @@ def main() -> None:
         assert report.endpoints[1].is_new is False
         assert report.domains[0].value == "www.example.com"
         assert report.tls_sni[0].is_new is True
+        assert report.ports[0].transport == "TCP"
+        assert report.ports[0].port == 443
         assert report.entropy_findings[0].entropy == 3.75
 
         invalid_report = temporary_root / "invalid.json"
