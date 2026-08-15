@@ -16,6 +16,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QIcon,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,6 +65,16 @@ ANALYZER = ROOT / "analyze.py"
 ENDPOINT_ENRICHER = ROOT / "enrich_endpoints.py"
 DEFAULT_BASELINE = ROOT / "data" / "findings_master.json"
 DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
+APP_ICON = ROOT / "assets" / "rvi-sentinel-logo.png"
+
+
+def load_application_icon(path: Path) -> QIcon:
+    if not path.is_file():
+        raise FileNotFoundError(f"RVI-Sentinel application icon not found: {path}")
+    icon = QIcon(str(path))
+    if icon.isNull():
+        raise ValueError(f"RVI-Sentinel application icon could not be decoded: {path}")
+    return icon
 
 
 class RviSentinelWindow(QMainWindow):
@@ -107,6 +118,7 @@ class RviSentinelWindow(QMainWindow):
 
     def configure_window(self) -> None:
         self.setWindowTitle("RVI-Sentinel")
+        self.setWindowIcon(load_application_icon(APP_ICON))
         self.resize(1180, 820)
         self.setMinimumSize(900, 680)
         self.setAcceptDrops(True)
@@ -188,6 +200,25 @@ class RviSentinelWindow(QMainWindow):
         )
         subtitle.setStyleSheet("color: #9ca3af; font-size: 14px;")
 
+        logo = QLabel()
+        logo.setObjectName("applicationLogo")
+        logo.setAccessibleName("RVI-Sentinel iOS packet-capture logo")
+        logo.setPixmap(self.windowIcon().pixmap(58, 58))
+        logo.setFixedSize(58, 58)
+
+        title_layout = QVBoxLayout()
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(2)
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(12)
+        header_layout.addWidget(logo)
+        header_layout.addLayout(title_layout)
+        header_layout.addStretch(1)
+
         scope = QLabel(
             "A new endpoint or hostname is a change to investigate, not proof of malicious activity. "
             "Encrypted payloads remain protected."
@@ -198,8 +229,7 @@ class RviSentinelWindow(QMainWindow):
             "border-radius: 4px; padding: 10px; color: #bfdbfe;"
         )
 
-        root_layout.addWidget(title)
-        root_layout.addWidget(subtitle)
+        root_layout.addLayout(header_layout)
         root_layout.addWidget(scope)
         root_layout.addWidget(self.create_configuration_group())
         root_layout.addLayout(self.create_action_row())
@@ -983,7 +1013,9 @@ def main(arguments: list[str]) -> int:
     qt_arguments = [argument for argument in arguments if argument != "--smoke-test"]
     application = QApplication(qt_arguments)
     application.setApplicationName("RVI-Sentinel")
+    application.setApplicationDisplayName("RVI-Sentinel")
     application.setOrganizationName("hideouts-io")
+    application.setWindowIcon(load_application_icon(APP_ICON))
 
     window = RviSentinelWindow()
     capture_path = initial_capture_path(arguments)

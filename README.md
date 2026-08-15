@@ -2,6 +2,10 @@
 
 ### Cross-platform iPhone/iPad packet capture and persistent network-baseline analysis
 
+<p align="center">
+  <img src="assets/rvi-sentinel-logo.png" width="220" alt="RVI-Sentinel iOS packet-capture logo">
+</p>
+
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-000000?logo=apple&logoColor=white)
 ![Capture](https://img.shields.io/badge/capture-PCAP%20%7C%20PCAPNG-0969da)
 ![Analysis](https://img.shields.io/badge/analysis-tshark%20%2B%20persistent%20baseline-8250df)
@@ -220,6 +224,8 @@ Launch the GUI:
 ```bash
 ./scripts/run_gui.sh
 ```
+
+On macOS, the launcher builds a lightweight local `dist/RVI-Sentinel.app` wrapper and starts its native entry point with the project icon so RVI-Sentinel has its own Dock identity. The generated application bundle stays outside version control. Launch through `scripts/run_gui.sh` so the app inherits the terminal's authorized access to a project stored in Documents without requesting broader disk access.
 
 Optionally open a capture immediately:
 

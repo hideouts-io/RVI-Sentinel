@@ -10,7 +10,7 @@ from pathlib import Path
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PySide6.QtCore import QEventLoop, QProcess, QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from gui import RviSentinelWindow
 from tests.test_analyzer import FAKE_TSHARK
@@ -36,6 +36,10 @@ def main() -> None:
         os.environ["PATH"] = f"{binary_directory}:{original_path}"
         try:
             window = RviSentinelWindow()
+            assert window.windowIcon().isNull() is False
+            logo = window.findChild(QLabel, "applicationLogo")
+            assert logo is not None
+            assert logo.pixmap().isNull() is False
             window.capture_field.setText(str(capture))
             window.baseline_field.setText(str(baseline))
             window.export_field.setText(str(exports))
@@ -111,6 +115,7 @@ def main() -> None:
 
     application.quit()
     print("PASS: headless GUI startup")
+    print("PASS: application icon and visible logo")
     print("PASS: GUI-to-analyzer process execution")
     print("PASS: generated report loading")
     print("PASS: summary and findings table population")
