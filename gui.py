@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Cross-platform analysis GUI for RVI-Sentinel."""
+"""Cross-platform iOS capture and analysis GUI for RVI-Sentinel."""
 
 from __future__ import annotations
 
 import shlex
 import shutil
 import sys
+import platform
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
@@ -17,9 +19,14 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QIcon,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -31,6 +38,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -53,6 +61,19 @@ from gui_models import (
     load_report,
     report_path_for,
 )
+from capture_models import (
+    CAPTURE_AUTHORIZATION_EVENT,
+    CAPTURE_PREFLIGHT_EVENT,
+    CAPTURE_STARTED_EVENT,
+    CAPTURE_VALIDATED_EVENT,
+    CaptureRequest,
+    CaptureValidationError,
+    DeviceInfo,
+    capture_session_arguments,
+    default_capture_path,
+    devices_from_json,
+    validate_capture_request,
+)
 from finding_enrichment import (
     EndpointEnrichment,
     classify_address,
@@ -63,8 +84,12 @@ from finding_enrichment import (
 ROOT = Path(__file__).resolve().parent
 ANALYZER = ROOT / "analyze.py"
 ENDPOINT_ENRICHER = ROOT / "enrich_endpoints.py"
+DEVICE_DISCOVERY = ROOT / "capture_devices.py"
+CAPTURE_SESSION = ROOT / "capture_session.py"
+CAPTURE_SUPPORT_SETUP = ROOT / "scripts" / "setup_rvi_capture.py"
 DEFAULT_BASELINE = ROOT / "data" / "findings_master.json"
 DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
+DEFAULT_CAPTURE_DIRECTORY = ROOT / "captures"
 APP_ICON = ROOT / "assets" / "rvi-sentinel-logo.png"
 
 
@@ -77,19 +102,206 @@ def load_application_icon(path: Path) -> QIcon:
     return icon
 
 
+class CaptureSetupDialog(QDialog):
+    """Collect one explicit, bounded capture request from the user."""
+
+    def __init__(self, devices: tuple[DeviceInfo, ...], parent: QWidget) -> None:
+        super().__init__(parent)
+        self.devices = tuple(device for device in devices if device.connected)
+        self.device_field = QComboBox()
+        self.duration_field = QSpinBox()
+        self.format_field = QComboBox()
+        self.output_field = QLineEdit()
+        self.analyze_field = QCheckBox("Analyze automatically when the capture finishes")
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        self.configure_dialog()
+
+    def configure_dialog(self) -> None:
+        self.setWindowTitle("New iPhone/iPad Capture")
+        self.setMinimumWidth(640)
+        layout = QVBoxLayout(self)
+
+        explanation = QLabel(
+            "Choose a connected, trusted iPhone or iPad and a bounded capture duration. "
+            "RVI-Sentinel records packet metadata to a local PCAP/PCAPNG file; it does not "
+            "decrypt protected payloads."
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet(
+            "background: #172554; border-left: 4px solid #3b82f6; "
+            "border-radius: 4px; padding: 10px; color: #bfdbfe;"
+        )
+        layout.addWidget(explanation)
+
+        form_group = QGroupBox("Capture settings")
+        form = QGridLayout(form_group)
+        form.setColumnStretch(1, 1)
+
+        for device in self.devices:
+            self.device_field.addItem(
+                f"{device.name} — {device.operating_system}", device.udid
+            )
+        if not self.devices:
+            self.device_field.addItem("No connected iPhone or iPad found")
+            self.device_field.setEnabled(False)
+        self.device_field.setAccessibleName("Connected iOS device")
+        self.device_field.setObjectName("captureDeviceField")
+
+        self.duration_field.setRange(5, 3_600)
+        self.duration_field.setValue(60)
+        self.duration_field.setSuffix(" seconds")
+        self.duration_field.setAccessibleName("Capture duration in seconds")
+        self.duration_field.setObjectName("captureDurationField")
+
+        self.format_field.addItems(("pcapng", "pcap"))
+        self.format_field.setAccessibleName("Capture format")
+        self.format_field.setObjectName("captureFormatField")
+
+        initial_device_name = self.devices[0].name if self.devices else "ios-device"
+        initial_output = default_capture_path(
+            DEFAULT_CAPTURE_DIRECTORY, initial_device_name, datetime.now(), "pcapng"
+        )
+        self.output_field.setText(str(initial_output))
+        self.output_field.setAccessibleName("Capture output file")
+        self.output_field.setObjectName("captureOutputField")
+        output_button = QPushButton("Choose…")
+        output_button.setObjectName("captureOutputBrowseButton")
+
+        self.analyze_field.setChecked(True)
+        self.analyze_field.setObjectName("analyzeAfterCaptureField")
+
+        form.addWidget(QLabel("Device"), 0, 0)
+        form.addWidget(self.device_field, 0, 1, 1, 2)
+        form.addWidget(QLabel("Duration"), 1, 0)
+        form.addWidget(self.duration_field, 1, 1, 1, 2)
+        form.addWidget(QLabel("Format"), 2, 0)
+        form.addWidget(self.format_field, 2, 1, 1, 2)
+        form.addWidget(QLabel("Save capture as"), 3, 0)
+        form.addWidget(self.output_field, 3, 1)
+        form.addWidget(output_button, 3, 2)
+        form.addWidget(self.analyze_field, 4, 1, 1, 2)
+        layout.addWidget(form_group)
+
+        permission_note = QLabel(capture_permission_note(platform.system()))
+        permission_note.setWordWrap(True)
+        permission_note.setStyleSheet("color: #9ca3af;")
+        layout.addWidget(permission_note)
+        layout.addWidget(self.buttons)
+
+        start_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        start_button.setText("Start Capture")
+        start_button.setEnabled(bool(self.devices))
+        output_button.clicked.connect(self.choose_output)
+        self.format_field.currentTextChanged.connect(self.update_output_extension)
+        self.buttons.accepted.connect(self.accept_request)
+        self.buttons.rejected.connect(self.reject)
+
+    def choose_output(self) -> None:
+        capture_format = self.format_field.currentText()
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Save iPhone/iPad capture",
+            self.output_field.text(),
+            f"{capture_format.upper()} captures (*.{capture_format});;All files (*)",
+        )
+        if selected:
+            path = Path(selected)
+            if path.suffix.lower() != f".{capture_format}":
+                path = path.with_suffix(f".{capture_format}")
+            self.output_field.setText(str(path))
+
+    def update_output_extension(self, capture_format: str) -> None:
+        output_text = self.output_field.text().strip()
+        if output_text:
+            self.output_field.setText(str(Path(output_text).with_suffix(f".{capture_format}")))
+
+    def capture_request(self) -> CaptureRequest:
+        index = self.device_field.currentIndex()
+        if index < 0 or index >= len(self.devices):
+            raise CaptureValidationError("Select a connected iPhone or iPad.")
+        output_text = self.output_field.text().strip()
+        if not output_text:
+            raise CaptureValidationError("Choose where to save the capture.")
+        request = CaptureRequest(
+            device=self.devices[index],
+            output_path=Path(output_text).expanduser().resolve(),
+            duration_seconds=self.duration_field.value(),
+            capture_format=self.format_field.currentText(),
+            analyze_after_capture=self.analyze_field.isChecked(),
+        )
+        validate_capture_request(request)
+        return request
+
+    def accept_request(self) -> None:
+        try:
+            self.capture_request()
+        except CaptureValidationError as error:
+            message = QMessageBox(self)
+            message.setIcon(QMessageBox.Icon.Critical)
+            message.setWindowTitle("Invalid capture settings")
+            message.setText("Invalid capture settings")
+            message.setInformativeText(str(error))
+            message.exec()
+            return
+        self.accept()
+
+
+def capture_permission_note(host_system: str) -> str:
+    if host_system == "Darwin":
+        return (
+            "macOS uses Apple rvictl and tcpdump. A native administrator authorization prompt "
+            "appears only when the timed capture starts; RVI-Sentinel never reads or stores your password."
+        )
+    if host_system == "Linux":
+        return (
+            "Linux requires libimobiledevice and a running usbmuxd service. The upstream "
+            "gh2o/rvi_capture backend must also be installed locally."
+        )
+    if host_system == "Windows":
+        return (
+            "Windows requires iTunes or Apple Mobile Device Support with its service running. "
+            "The upstream gh2o/rvi_capture backend must also be installed locally."
+        )
+    return f"iOS capture is not supported on {host_system}."
+
+
 class RviSentinelWindow(QMainWindow):
-    """Main analysis window backed by the existing analyzer CLI."""
+    """Main capture and analysis window backed by the existing CLI tools."""
 
     def __init__(self) -> None:
         super().__init__()
         self.process = QProcess(self)
         self.enrichment_process = QProcess(self)
+        self.device_process = QProcess(self)
+        self.capture_process = QProcess(self)
+        self.setup_process = QProcess(self)
         self.enrichment_timer = QTimer(self)
         self.enrichment_timer.setSingleShot(True)
+        self.capture_timer = QTimer(self)
+        self.capture_timer.setInterval(1_000)
         self.enrichment_timed_out = False
         self.active_request: AnalysisRequest | None = None
         self.active_report_path: Path | None = None
+        self.active_capture_request: CaptureRequest | None = None
+        self.discovered_devices: tuple[DeviceInfo, ...] = ()
+        self.capture_elapsed_seconds = 0
+        self.capture_countdown_started = False
+        self.capture_event_buffer = ""
+        self.capture_error_buffer = ""
+        self.capture_cancel_requested = False
         self.summary_labels: dict[str, QLabel] = {}
+
+        self.workspace_tabs = QTabWidget()
+        self.device_table = create_device_table()
+        self.capture_status_label = QLabel("Connect and unlock an iPhone or iPad, then refresh devices.")
+        self.capture_progress = QProgressBar()
+        self.capture_console = QTextEdit()
+        self.refresh_devices_button = QPushButton("Refresh Devices")
+        self.new_capture_button = QPushButton("New Capture…")
+        self.cancel_capture_button = QPushButton("Cancel Capture")
+        self.install_capture_support_button = QPushButton("Install Capture Support")
 
         self.capture_field = QLineEdit()
         self.baseline_field = QLineEdit(str(DEFAULT_BASELINE))
@@ -115,6 +327,7 @@ class RviSentinelWindow(QMainWindow):
         self.build_interface()
         self.connect_signals()
         self.refresh_command_preview()
+        QTimer.singleShot(0, self.refresh_devices)
 
     def configure_window(self) -> None:
         self.setWindowTitle("RVI-Sentinel")
@@ -125,6 +338,7 @@ class RviSentinelWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow { background: #0b1220; }
+            QDialog { background: #0b1220; }
             QWidget { color: #e6edf3; font-size: 13px; }
             QLabel#applicationTitle { font-size: 28px; font-weight: 700; }
             QGroupBox {
@@ -135,13 +349,22 @@ class RviSentinelWindow(QMainWindow):
                 font-weight: 600;
             }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
                 background: #111827;
                 border: 1px solid #374151;
                 border-radius: 6px;
                 padding: 6px;
                 selection-background-color: #2563eb;
             }
+            QComboBox::drop-down { border: 0; width: 24px; }
+            QProgressBar {
+                background: #111827;
+                border: 1px solid #374151;
+                border-radius: 6px;
+                text-align: center;
+                min-height: 20px;
+            }
+            QProgressBar::chunk { background: #1f6feb; border-radius: 5px; }
             QTableWidget {
                 background: #111827;
                 alternate-background-color: #0f172a;
@@ -196,7 +419,7 @@ class RviSentinelWindow(QMainWindow):
         title.setFont(title_font)
 
         subtitle = QLabel(
-            "Authorized PCAP/PCAPNG analysis with persistent new-versus-known baselining"
+            "Guided iPhone/iPad capture and persistent PCAP/PCAPNG baseline analysis"
         )
         subtitle.setStyleSheet("color: #9ca3af; font-size: 14px;")
 
@@ -231,12 +454,97 @@ class RviSentinelWindow(QMainWindow):
 
         root_layout.addLayout(header_layout)
         root_layout.addWidget(scope)
-        root_layout.addWidget(self.create_configuration_group())
-        root_layout.addLayout(self.create_action_row())
-        root_layout.addWidget(self.create_results_tabs(), 1)
-        root_layout.addWidget(self.status_label)
+        self.workspace_tabs.setObjectName("workspaceTabs")
+        self.workspace_tabs.setDocumentMode(True)
+        self.workspace_tabs.addTab(self.create_capture_workspace(), "Capture iPhone/iPad")
+        self.workspace_tabs.addTab(self.create_analysis_workspace(), "Analyze Capture")
+        self.workspace_tabs.setCurrentIndex(0)
+        root_layout.addWidget(self.workspace_tabs, 1)
 
         self.setCentralWidget(root_widget)
+
+    def create_capture_workspace(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "1. Connect and trust the iPhone or iPad.  2. Refresh the device list.  "
+            "3. Choose New Capture to select the device, duration, format, and local output file."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("font-size: 14px; color: #cbd5e1;")
+        layout.addWidget(intro)
+
+        device_group = QGroupBox("Connected Apple mobile devices")
+        device_layout = QVBoxLayout(device_group)
+        host_label = QLabel(
+            f"Capture host: {platform.system()} • {capture_backend_summary(platform.system())}"
+        )
+        host_label.setObjectName("captureBackendLabel")
+        host_label.setStyleSheet("color: #9ca3af;")
+        device_layout.addWidget(host_label)
+        device_layout.addWidget(self.device_table, 1)
+
+        device_actions = QHBoxLayout()
+        self.refresh_devices_button.setObjectName("refreshDevicesButton")
+        self.new_capture_button.setObjectName("newCaptureButton")
+        self.cancel_capture_button.setObjectName("cancelCaptureButton")
+        self.install_capture_support_button.setObjectName("installCaptureSupportButton")
+        self.new_capture_button.setEnabled(False)
+        self.cancel_capture_button.setEnabled(False)
+        self.install_capture_support_button.setVisible(platform.system() in {"Linux", "Windows"})
+        device_actions.addWidget(self.refresh_devices_button)
+        device_actions.addWidget(self.new_capture_button)
+        device_actions.addWidget(self.cancel_capture_button)
+        device_actions.addWidget(self.install_capture_support_button)
+        device_actions.addStretch(1)
+        device_layout.addLayout(device_actions)
+        layout.addWidget(device_group, 2)
+
+        progress_group = QGroupBox("Capture activity")
+        progress_layout = QVBoxLayout(progress_group)
+        self.capture_status_label.setObjectName("captureStatusLabel")
+        self.capture_status_label.setWordWrap(True)
+        self.capture_progress.setObjectName("captureProgress")
+        self.capture_progress.setRange(0, 1)
+        self.capture_progress.setValue(0)
+        self.capture_progress.setFormat("Ready")
+        self.capture_console.setObjectName("captureConsole")
+        self.capture_console.setAccessibleName("Capture activity log")
+        self.capture_console.setReadOnly(True)
+        self.capture_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        console_font = QFont("Menlo")
+        console_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.capture_console.setFont(console_font)
+        progress_layout.addWidget(self.capture_status_label)
+        progress_layout.addWidget(self.capture_progress)
+        progress_layout.addWidget(self.capture_console, 1)
+        layout.addWidget(progress_group, 1)
+
+        privacy = QLabel(
+            "Captures stay at the local path you choose. Only capture files you are authorized "
+            "to inspect. RVI-Sentinel does not upload captures or device identifiers."
+        )
+        privacy.setWordWrap(True)
+        privacy.setStyleSheet(
+            "background: #052e16; border-left: 4px solid #22c55e; "
+            "border-radius: 4px; padding: 9px; color: #bbf7d0;"
+        )
+        layout.addWidget(privacy)
+        return page
+
+    def create_analysis_workspace(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        layout.addWidget(self.create_configuration_group())
+        layout.addLayout(self.create_action_row())
+        layout.addWidget(self.create_results_tabs(), 1)
+        layout.addWidget(self.status_label)
+        return page
 
     def create_configuration_group(self) -> QGroupBox:
         group = QGroupBox("Analysis configuration")
@@ -411,6 +719,357 @@ class RviSentinelWindow(QMainWindow):
         self.enrichment_process.finished.connect(self.endpoint_enrichment_finished)
         self.enrichment_process.errorOccurred.connect(self.endpoint_enrichment_error)
         self.enrichment_timer.timeout.connect(self.endpoint_enrichment_timeout)
+        self.refresh_devices_button.clicked.connect(self.refresh_devices)
+        self.new_capture_button.clicked.connect(self.open_capture_dialog)
+        self.cancel_capture_button.clicked.connect(self.cancel_capture)
+        self.install_capture_support_button.clicked.connect(self.install_capture_support)
+        self.device_process.finished.connect(self.device_discovery_finished)
+        self.device_process.errorOccurred.connect(self.device_discovery_error)
+        self.capture_process.readyReadStandardOutput.connect(self.read_capture_output)
+        self.capture_process.readyReadStandardError.connect(self.read_capture_error)
+        self.capture_process.finished.connect(self.capture_finished)
+        self.capture_process.errorOccurred.connect(self.capture_process_error)
+        self.setup_process.readyReadStandardOutput.connect(self.read_setup_output)
+        self.setup_process.readyReadStandardError.connect(self.read_setup_error)
+        self.setup_process.finished.connect(self.capture_support_finished)
+        self.setup_process.errorOccurred.connect(self.capture_support_error)
+        self.capture_timer.timeout.connect(self.advance_capture_progress)
+
+    def refresh_devices(self) -> None:
+        if self.device_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.refresh_devices_button.setEnabled(False)
+        self.new_capture_button.setEnabled(False)
+        self.capture_status_label.setText("Looking for physical iPhone and iPad devices…")
+        self.capture_console.append(f"$ {shlex.join([sys.executable, str(DEVICE_DISCOVERY)])}")
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONUNBUFFERED", "1")
+        self.device_process.setProcessEnvironment(environment)
+        self.device_process.setWorkingDirectory(str(ROOT))
+        self.device_process.setProgram(sys.executable)
+        self.device_process.setArguments([str(DEVICE_DISCOVERY)])
+        self.device_process.start()
+
+    def device_discovery_finished(
+        self, exit_code: int, _exit_status: QProcess.ExitStatus
+    ) -> None:
+        self.refresh_devices_button.setEnabled(True)
+        output = bytes(self.device_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        error_output = bytes(self.device_process.readAllStandardError()).decode(
+            "utf-8", errors="replace"
+        )
+        if exit_code != 0:
+            self.discovered_devices = ()
+            populate_device_table(self.device_table, self.discovered_devices)
+            detail = error_output.strip() or output.strip() or "No diagnostic output was returned."
+            self.capture_console.append(detail)
+            self.capture_status_label.setText(f"Device discovery failed: {detail}")
+            self.new_capture_button.setEnabled(False)
+            return
+        try:
+            devices = devices_from_json(output)
+        except CaptureValidationError as error:
+            self.discovered_devices = ()
+            populate_device_table(self.device_table, self.discovered_devices)
+            self.capture_console.append(str(error))
+            self.capture_status_label.setText(str(error))
+            self.new_capture_button.setEnabled(False)
+            return
+        self.discovered_devices = devices
+        populate_device_table(self.device_table, devices)
+        connected_count = sum(1 for device in devices if device.connected)
+        if connected_count:
+            self.capture_status_label.setText(
+                f"Ready: {connected_count} connected iOS device(s) available for capture."
+            )
+        elif devices:
+            self.capture_status_label.setText(
+                "An iPhone/iPad was recognized but is offline. Connect it by USB, unlock it, "
+                "tap Trust if prompted, and refresh."
+            )
+        else:
+            self.capture_status_label.setText(
+                "No physical iPhone or iPad was found. Connect by USB, unlock, trust this host, "
+                "and choose Refresh Devices."
+            )
+        self.new_capture_button.setEnabled(connected_count > 0)
+
+    def device_discovery_error(self, error: QProcess.ProcessError) -> None:
+        self.refresh_devices_button.setEnabled(True)
+        self.new_capture_button.setEnabled(False)
+        detail = f"Could not start device discovery: {error.name}"
+        self.capture_console.append(detail)
+        self.capture_status_label.setText(detail)
+
+    def open_capture_dialog(self) -> None:
+        if self.capture_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        dialog = CaptureSetupDialog(self.discovered_devices, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            request = dialog.capture_request()
+            arguments = capture_session_arguments(request, CAPTURE_SESSION)
+        except CaptureValidationError as error:
+            self.show_error("Invalid capture settings", str(error))
+            return
+        self.start_capture(request, arguments)
+
+    def start_capture(self, request: CaptureRequest, arguments: list[str]) -> None:
+        if self.capture_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.active_capture_request = request
+        self.capture_elapsed_seconds = 0
+        self.capture_countdown_started = False
+        self.capture_event_buffer = ""
+        self.capture_error_buffer = ""
+        self.capture_cancel_requested = False
+        self.capture_timer.stop()
+        self.capture_console.clear()
+        exact_command = shlex.join([sys.executable, *arguments])
+        self.capture_console.append(f"$ {exact_command}\n")
+        self.capture_status_label.setText(
+            f"Verifying {request.device.name} and preparing its capture interface…"
+        )
+        self.capture_progress.setRange(0, 0)
+        self.capture_progress.setFormat("Preparing capture")
+        self.refresh_devices_button.setEnabled(False)
+        self.new_capture_button.setEnabled(False)
+        self.cancel_capture_button.setEnabled(True)
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONUNBUFFERED", "1")
+        self.capture_process.setProcessEnvironment(environment)
+        self.capture_process.setWorkingDirectory(str(ROOT))
+        self.capture_process.setProgram(sys.executable)
+        self.capture_process.setArguments(arguments)
+        self.capture_process.start()
+
+    def advance_capture_progress(self) -> None:
+        request = self.active_capture_request
+        if request is None or not self.capture_countdown_started:
+            self.capture_timer.stop()
+            return
+        self.capture_elapsed_seconds = min(
+            self.capture_elapsed_seconds + 1, request.duration_seconds
+        )
+        self.capture_progress.setValue(self.capture_elapsed_seconds)
+        self.capture_progress.setFormat(
+            f"{self.capture_elapsed_seconds} / {request.duration_seconds} seconds"
+        )
+        if self.capture_elapsed_seconds >= request.duration_seconds:
+            self.capture_timer.stop()
+            self.capture_progress.setFormat(
+                f"{request.duration_seconds} / {request.duration_seconds} seconds — Finalizing"
+            )
+            self.capture_status_label.setText(
+                "Capture duration reached. Closing and validating the packet file…"
+            )
+
+    def read_capture_output(self) -> None:
+        output = bytes(self.capture_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        if output:
+            self.capture_console.moveCursor(QTextCursor.MoveOperation.End)
+            self.capture_console.insertPlainText(output)
+            self.consume_capture_events(output)
+
+    def consume_capture_events(self, output: str) -> None:
+        self.capture_event_buffer += output
+        while "\n" in self.capture_event_buffer:
+            line, self.capture_event_buffer = self.capture_event_buffer.split("\n", 1)
+            self.handle_capture_event(line.strip())
+
+    def handle_capture_event(self, event: str) -> None:
+        request = self.active_capture_request
+        if request is None:
+            return
+        if event == CAPTURE_AUTHORIZATION_EVENT:
+            self.capture_status_label.setText(
+                "Approve the native macOS authorization prompt for tcpdump. "
+                "The capture countdown has not started."
+            )
+            self.capture_progress.setRange(0, 0)
+            self.capture_progress.setFormat("Waiting for tcpdump authorization")
+            return
+        if event == CAPTURE_PREFLIGHT_EVENT:
+            self.capture_status_label.setText(
+                "Authorization accepted. Verifying that RVI delivers a packet within five seconds…"
+            )
+            self.capture_progress.setRange(0, 0)
+            self.capture_progress.setFormat("Testing live RVI traffic")
+            return
+        if event == CAPTURE_STARTED_EVENT and not self.capture_countdown_started:
+            self.capture_countdown_started = True
+            self.capture_elapsed_seconds = 0
+            self.capture_progress.setRange(0, request.duration_seconds)
+            self.capture_progress.setValue(0)
+            self.capture_progress.setFormat(f"0 / {request.duration_seconds} seconds")
+            self.capture_status_label.setText(
+                f"Live packets verified. Capturing {request.device.name} for "
+                f"{request.duration_seconds} seconds…"
+            )
+            self.capture_timer.start()
+            return
+        if event == CAPTURE_VALIDATED_EVENT:
+            self.capture_timer.stop()
+            self.capture_progress.setRange(0, request.duration_seconds)
+            self.capture_progress.setValue(request.duration_seconds)
+            self.capture_progress.setFormat("Capture validated")
+            self.capture_status_label.setText(
+                "Capture file closed successfully and contains readable packets."
+            )
+
+    def read_capture_error(self) -> None:
+        output = bytes(self.capture_process.readAllStandardError()).decode(
+            "utf-8", errors="replace"
+        )
+        if output:
+            self.capture_error_buffer += output
+            self.capture_console.moveCursor(QTextCursor.MoveOperation.End)
+            self.capture_console.insertPlainText(output)
+
+    def cancel_capture(self) -> None:
+        if self.capture_process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self.capture_status_label.setText("Cancelling capture and cleaning up its interface…")
+        self.capture_console.append("\nCancellation requested by user.")
+        self.capture_cancel_requested = True
+        self.cancel_capture_button.setEnabled(False)
+        self.capture_process.terminate()
+        QTimer.singleShot(15_000, self.force_kill_capture)
+
+    def force_kill_capture(self) -> None:
+        if self.capture_process.state() != QProcess.ProcessState.NotRunning:
+            self.capture_console.append(
+                "Capture helper did not exit within 15 seconds; forcing it to stop."
+            )
+            self.capture_process.kill()
+
+    def capture_finished(
+        self, exit_code: int, _exit_status: QProcess.ExitStatus
+    ) -> None:
+        self.read_capture_output()
+        self.read_capture_error()
+        if self.capture_event_buffer:
+            self.handle_capture_event(self.capture_event_buffer.strip())
+            self.capture_event_buffer = ""
+        self.capture_timer.stop()
+        request = self.active_capture_request
+        cancellation_requested = self.capture_cancel_requested
+        self.active_capture_request = None
+        self.capture_cancel_requested = False
+        self.cancel_capture_button.setEnabled(False)
+        self.refresh_devices_button.setEnabled(True)
+        self.new_capture_button.setEnabled(
+            any(device.connected for device in self.discovered_devices)
+        )
+        if request is None:
+            self.capture_status_label.setText(
+                f"Capture process exited with code {exit_code}, but no active request was recorded."
+            )
+            return
+        if exit_code != 0:
+            self.capture_progress.setRange(0, 1)
+            self.capture_progress.setValue(0)
+            if cancellation_requested:
+                self.capture_progress.setFormat("Capture cancelled")
+                self.capture_status_label.setText(
+                    "Capture cancelled. The RVI interface was removed and any partial local "
+                    "capture remains at its selected path."
+                )
+                QTimer.singleShot(0, self.refresh_devices)
+                return
+            self.capture_progress.setFormat("Capture failed")
+            backend_detail = self.capture_error_buffer.strip()
+            detail = backend_detail or (
+                f"Capture failed with exit code {exit_code}, but the backend returned no "
+                "diagnostic output."
+            )
+            self.capture_status_label.setText(detail)
+            self.show_error("Capture failed", detail)
+            QTimer.singleShot(0, self.refresh_devices)
+            return
+        if not request.output_path.is_file():
+            detail = f"Capture completed without creating the expected file: {request.output_path}"
+            self.capture_progress.setFormat("Capture file missing")
+            self.capture_status_label.setText(detail)
+            self.show_error("Capture file missing", detail)
+            return
+
+        self.capture_progress.setRange(0, request.duration_seconds)
+        self.capture_progress.setValue(request.duration_seconds)
+        self.capture_progress.setFormat("Capture complete")
+        self.capture_status_label.setText(f"Capture complete: {request.output_path}")
+        self.capture_console.append(f"\nReady to analyze: {request.output_path}")
+        self.capture_field.setText(str(request.output_path))
+        self.workspace_tabs.setCurrentIndex(1)
+        if request.analyze_after_capture:
+            QTimer.singleShot(0, self.start_analysis)
+        QTimer.singleShot(0, self.refresh_devices)
+
+    def capture_process_error(self, error: QProcess.ProcessError) -> None:
+        detail = f"Could not run the capture helper: {error.name}"
+        self.capture_console.append(detail)
+        self.capture_status_label.setText(detail)
+
+    def install_capture_support(self) -> None:
+        if platform.system() not in {"Linux", "Windows"}:
+            self.show_error(
+                "Capture support installation is not required",
+                "macOS uses Apple rvictl and tcpdump instead of the upstream helper.",
+            )
+            return
+        if self.setup_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.capture_console.append(
+            f"$ {shlex.join([sys.executable, str(CAPTURE_SUPPORT_SETUP)])}\n"
+        )
+        self.install_capture_support_button.setEnabled(False)
+        self.capture_status_label.setText("Installing the upstream capture backend locally…")
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONUNBUFFERED", "1")
+        self.setup_process.setProcessEnvironment(environment)
+        self.setup_process.setWorkingDirectory(str(ROOT))
+        self.setup_process.setProgram(sys.executable)
+        self.setup_process.setArguments([str(CAPTURE_SUPPORT_SETUP)])
+        self.setup_process.start()
+
+    def read_setup_output(self) -> None:
+        output = bytes(self.setup_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        if output:
+            self.capture_console.insertPlainText(output)
+
+    def read_setup_error(self) -> None:
+        output = bytes(self.setup_process.readAllStandardError()).decode(
+            "utf-8", errors="replace"
+        )
+        if output:
+            self.capture_console.insertPlainText(output)
+
+    def capture_support_finished(
+        self, exit_code: int, _exit_status: QProcess.ExitStatus
+    ) -> None:
+        self.read_setup_output()
+        self.read_setup_error()
+        self.install_capture_support_button.setEnabled(True)
+        if exit_code != 0:
+            self.capture_status_label.setText(
+                f"Capture support installation failed with exit code {exit_code}."
+            )
+            return
+        self.capture_status_label.setText("Capture support installed; refreshing devices…")
+        QTimer.singleShot(0, self.refresh_devices)
+
+    def capture_support_error(self, error: QProcess.ProcessError) -> None:
+        self.install_capture_support_button.setEnabled(True)
+        detail = f"Could not run capture support setup: {error.name}"
+        self.capture_console.append(detail)
+        self.capture_status_label.setText(detail)
 
     def choose_capture(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
@@ -760,15 +1419,63 @@ class RviSentinelWindow(QMainWindow):
         if len(urls) != 1 or not urls[0].isLocalFile():
             return
         self.capture_field.setText(urls[0].toLocalFile())
+        self.workspace_tabs.setCurrentIndex(1)
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.enrichment_timer.stop()
-        for process in (self.process, self.enrichment_process):
+        self.capture_timer.stop()
+        for process in (
+            self.process,
+            self.enrichment_process,
+            self.device_process,
+            self.capture_process,
+            self.setup_process,
+        ):
             if process.state() != QProcess.ProcessState.NotRunning:
-                process.kill()
-                process.waitForFinished(1_000)
+                process.terminate()
+                if not process.waitForFinished(5_000):
+                    process.kill()
+                    process.waitForFinished(1_000)
         super().closeEvent(event)
+
+
+def capture_backend_summary(host_system: str) -> str:
+    if host_system == "Darwin":
+        return "Apple rvictl + rvi interface + tcpdump"
+    if host_system in {"Linux", "Windows"}:
+        return "gh2o/rvi_capture + libimobiledevice"
+    return "unsupported capture host"
+
+
+def create_device_table() -> QTableWidget:
+    table = QTableWidget(0, 4)
+    table.setHorizontalHeaderLabels(("Device", "OS / model", "Device identifier", "Status"))
+    table.setAccessibleName("Recognized physical iPhone and iPad devices")
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+    return table
+
+
+def populate_device_table(
+    table: QTableWidget, devices: tuple[DeviceInfo, ...]
+) -> None:
+    table.setSortingEnabled(False)
+    table.setRowCount(len(devices))
+    for row_index, device in enumerate(devices):
+        status_item = QTableWidgetItem(device.status)
+        status_item.setForeground(QColor("#3fb950" if device.connected else "#fbbf24"))
+        table.setItem(row_index, 0, QTableWidgetItem(device.name))
+        table.setItem(row_index, 1, QTableWidgetItem(device.operating_system))
+        table.setItem(row_index, 2, QTableWidgetItem(device.udid))
+        table.setItem(row_index, 3, status_item)
+    table.setSortingEnabled(True)
 
 
 def create_ranked_table(headers: tuple[str, str, str]) -> QTableWidget:
@@ -1009,6 +1716,23 @@ def initial_capture_path(arguments: list[str]) -> str | None:
     return str(Path(candidates[0]).expanduser().resolve())
 
 
+def present_main_window(window: RviSentinelWindow) -> None:
+    window.setWindowState(Qt.WindowState.WindowNoState)
+    if window.width() < 900 or window.height() < 680:
+        window.resize(1180, 820)
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        visible = available.intersected(window.frameGeometry())
+        if visible.width() < 300 or visible.height() < 240:
+            frame = window.frameGeometry()
+            frame.moveCenter(available.center())
+            window.move(frame.topLeft())
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
+
+
 def main(arguments: list[str]) -> int:
     qt_arguments = [argument for argument in arguments if argument != "--smoke-test"]
     application = QApplication(qt_arguments)
@@ -1021,7 +1745,9 @@ def main(arguments: list[str]) -> int:
     capture_path = initial_capture_path(arguments)
     if capture_path is not None:
         window.capture_field.setText(capture_path)
-    window.show()
+        window.workspace_tabs.setCurrentIndex(1)
+    present_main_window(window)
+    QTimer.singleShot(50, lambda: present_main_window(window))
 
     if "--smoke-test" in arguments:
         QTimer.singleShot(250, application.quit)

@@ -4,8 +4,7 @@ set -euo pipefail
 
 readonly PROJECT_DIR="${0:A:h:h}"
 readonly PYTHON_EXECUTABLE="$PROJECT_DIR/venv/bin/python"
-readonly MACOS_APP="$PROJECT_DIR/dist/RVI-Sentinel.app"
-readonly MACOS_EXECUTABLE="$MACOS_APP/Contents/MacOS/RVI-Sentinel"
+readonly MACOS_APP="${TMPDIR:-/tmp}/rvi-sentinel-app/RVI-Sentinel.app"
 
 if [[ ! -x "$PYTHON_EXECUTABLE" ]]; then
   print -u2 "RVI-Sentinel GUI environment not found: $PROJECT_DIR/venv"
@@ -17,7 +16,12 @@ fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   "$PROJECT_DIR/scripts/build_macos_app.sh"
-  exec "$MACOS_EXECUTABLE" "$@"
+  if [[ "${1:-}" == "--smoke-test" ]]; then
+    /usr/bin/open -n -W "$MACOS_APP" --args --project-dir "$PROJECT_DIR" "$@"
+    exit 0
+  fi
+  /usr/bin/open -n "$MACOS_APP" --args --project-dir "$PROJECT_DIR" "$@"
+  exit 0
 fi
 
 exec "$PYTHON_EXECUTABLE" "$PROJECT_DIR/gui.py" "$@"

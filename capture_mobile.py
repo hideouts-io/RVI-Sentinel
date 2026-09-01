@@ -14,6 +14,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from capture_models import MAXIMUM_CAPTURE_SECONDS, MINIMUM_CAPTURE_SECONDS
+from capture_session import CaptureProcessController, CaptureSessionError
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_UPSTREAM = ROOT / "tools" / "rvi_capture" / "rvi_capture.py"
 ANALYZER = ROOT / "analyze.py"
@@ -26,6 +29,11 @@ def main() -> int:
     parser.add_argument("outfile", type=Path, help="Output .pcap or .pcapng")
     parser.add_argument("--udid", help="Specific iOS device UDID; upstream selects the first device if omitted")
     parser.add_argument("--format", choices=("pcap", "pcapng"), default="pcapng")
+    parser.add_argument(
+        "--duration",
+        type=int,
+        help="Stop cleanly after this many seconds; omit for an open-ended CLI capture",
+    )
     parser.add_argument("--upstream", type=Path, default=DEFAULT_UPSTREAM,
                         help="Path to upstream rvi_capture.py")
     parser.add_argument("--analyze", action="store_true",
@@ -49,6 +57,15 @@ def main() -> int:
         print("Install it with:", file=sys.stderr)
         print("  python3 scripts/setup_rvi_capture.py", file=sys.stderr)
         return 2
+    if args.duration is not None and not (
+        MINIMUM_CAPTURE_SECONDS <= args.duration <= MAXIMUM_CAPTURE_SECONDS
+    ):
+        print(
+            f"Capture duration must be between {MINIMUM_CAPTURE_SECONDS} and "
+            f"{MAXIMUM_CAPTURE_SECONDS} seconds.",
+            file=sys.stderr,
+        )
+        return 2
 
     args.outfile.parent.mkdir(parents=True, exist_ok=True)
 
@@ -60,9 +77,21 @@ def main() -> int:
     print(f"Host OS: {host}")
     print("Capture backend: https://github.com/gh2o/rvi_capture")
     print("+", " ".join(cmd))
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        return result.returncode
+    controller = CaptureProcessController()
+    controller.install_signal_handlers()
+    creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if host == "Windows" else 0
+    try:
+        if args.duration is None:
+            return_code = controller.run_until_exit(cmd, creation_flags)
+        else:
+            return_code = controller.run_for_duration(
+                cmd, args.duration, creation_flags
+            )
+    except CaptureSessionError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if return_code != 0:
+        return return_code
 
     if args.analyze:
         analyze_cmd = [

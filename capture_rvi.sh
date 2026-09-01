@@ -33,7 +33,7 @@ cmd="${1:-}"
 case "$cmd" in
   devices)
     require_cmd xcrun
-    xcrun xctrace list devices
+    xcrun devicectl list devices --columns '*'
     ;;
 
   start)
@@ -62,7 +62,18 @@ case "$cmd" in
     mkdir -p "$(dirname "$output")"
     echo "Capturing $iface -> $output"
     echo "Press Ctrl-C to stop."
-    sudo tcpdump -i "$iface" -s 0 -U -n -w "$output"
+    case "${output:l}" in
+      *.pcapng)
+        sudo tcpdump -i "$iface" -s 0 -U -n --apple-pcapng -Z "$USER" -w "$output"
+        ;;
+      *.pcap)
+        sudo tcpdump -i "$iface" -s 0 -U -n -y RAW -Z "$USER" -w "$output"
+        ;;
+      *)
+        echo "Capture output must end in .pcapng or .pcap: $output" >&2
+        exit 2
+        ;;
+    esac
     ;;
 
   stop)

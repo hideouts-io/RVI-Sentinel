@@ -23,7 +23,7 @@
 - [Overall Architecture](#overall-architecture)
 - [Verified Analyzer Screenshot](#verified-analyzer-screenshot)
 - [Installation](#installation)
-- [Desktop Analysis GUI](#desktop-analysis-gui)
+- [Desktop GUI](#desktop-gui)
 - [Analyze an Existing Capture](#analyze-an-existing-capture)
 - [macOS Capture with Apple RVI](#macos-capture-with-apple-rvi)
 - [Linux and Windows Capture](#linux-and-windows-capture)
@@ -95,7 +95,7 @@ flowchart TB
 
     Capture[PCAP / PCAPNG evidence]
     Tshark[tshark field extraction]
-    GUI[Optional PySide6 desktop GUI]
+    GUI[PySide6 capture + analysis GUI]
     Analyzer[analyze.py CLI engine]
     Metadata[IP / ports / DNS / TLS SNI / QUIC heuristics]
     Report[Current JSON + CSV reports]
@@ -103,6 +103,8 @@ flowchart TB
 
     Device -->|USB| Mac
     Device -->|USB| Cross
+    GUI -->|orchestrates| Mac
+    GUI -->|orchestrates| Cross
     Mac --> Capture
     Cross --> Capture
     Capture --> GUI --> Analyzer
@@ -192,9 +194,18 @@ The CLI analyzer uses Python's standard library. Packet decoding requires `tshar
 
 ---
 
-## Desktop Analysis GUI
+## Desktop GUI
 
-The desktop GUI wraps the existing analyzer without replacing it. It supports:
+The desktop GUI presents capture and analysis as two separate workspaces. It supports:
+
+- recognizing physical iPhone/iPad devices and showing connected-versus-offline state;
+- selecting a connected device in a guided capture dialog;
+- choosing a bounded capture duration from 5 seconds to 60 minutes;
+- choosing PCAPNG or PCAP and a local output path without overwriting existing evidence;
+- macOS readiness checks through Apple `devicectl`, followed by `rvictl`, a temporary RVI interface, and `tcpdump`;
+- Linux/Windows capture through the separately installed `gh2o/rvi_capture` backend;
+- live progress, activity output, cancellation, and platform-specific errors;
+- optional automatic handoff from a completed capture into analysis;
 
 - selecting or dropping an authorized PCAP, PCAPNG, or CAP file;
 - choosing a persistent baseline and export directory;
@@ -208,8 +219,6 @@ The desktop GUI wraps the existing analyzer without replacing it. It supports:
 - a report-specific Interpretation view that explains scope, caveats, and next steps;
 - explicit new-versus-known baseline labels;
 - opening the generated export directory.
-
-Live device capture remains in the existing platform-specific CLI workflows while the GUI capture boundary is developed and validated.
 
 Create a project-local environment and install the optional GUI dependency:
 
@@ -226,15 +235,21 @@ Launch the GUI:
 ./scripts/run_gui.sh
 ```
 
-On macOS, the launcher builds a lightweight local `dist/RVI-Sentinel.app` wrapper and starts its native entry point with the project icon so RVI-Sentinel has its own Dock identity. The generated application bundle stays outside version control. Launch through `scripts/run_gui.sh` so the app inherits the terminal's authorized access to a project stored in Documents without requesting broader disk access.
+On macOS, the launcher builds and ad-hoc signs a lightweight runtime app wrapper in the system temporary directory, outside a File Provider-managed Documents checkout. It starts with the project icon so RVI-Sentinel has its own Dock identity while all source, captures, baselines, and exports remain at their selected project paths. The generated wrapper stays outside version control and is recreated by `scripts/run_gui.sh`.
 
-Optionally open a capture immediately:
+The app opens on **Capture iPhone/iPad**. Connect the device by USB, unlock it, trust the host if prompted, and choose **Refresh Devices**. **New Capture…** opens a dialog for the device, duration, format, output path, and automatic-analysis choice. Offline devices are recognized but cannot be selected until connected.
+
+On macOS, the timed capture requires a physical, booted, paired iPhone/iPad connected over USB. It then uses a narrow native administrator authorization prompt for `tcpdump`; RVI-Sentinel never asks for, reads, stores, or transmits the Mac password. The countdown stays stopped while authorization is pending and during a five-second live-packet preflight. Completed captures are closed, checked for the requested PCAP/PCAPNG header, and required to contain at least one readable packet before automatic analysis begins. The temporary RVI interface is removed after success, failure, or cancellation.
+
+On Linux and Windows, choose **Install Capture Support** once to clone the canonical `gh2o/rvi_capture` source into the ignored local `tools/` directory. Linux still requires `libimobiledevice` and `usbmuxd`; Windows still requires iTunes or Apple Mobile Device Support and its running service.
+
+Optionally open an existing capture immediately:
 
 ```bash
 ./scripts/run_gui.sh captures/authorized-capture.pcapng
 ```
 
-The GUI requires the same `tshark` runtime dependency as the CLI analyzer. It does not elevate privileges, capture live traffic, or bypass encryption.
+Analysis requires the same `tshark` runtime dependency as the CLI analyzer. Live capture follows the platform-specific prerequisites below and never bypasses device trust, host authorization, or encryption.
 
 ### Local GeoIP setup
 
@@ -339,7 +354,7 @@ Capture:
 Equivalent manual command:
 
 ```bash
-sudo tcpdump -i rvi0 -n -s 0 -U \
+sudo tcpdump -i rvi0 -n -s 0 -U --apple-pcapng -Z "$USER" \
   -w captures/ios_capture.pcapng
 ```
 
@@ -617,12 +632,13 @@ Run:
 
 ```bash
 python3 tests/test_analyzer.py
+python3 -m tests.test_capture_models
 python3 -m tests.test_gui_models
 python3 -m tests.test_finding_enrichment
 QT_QPA_PLATFORM=offscreen venv/bin/python -m tests.test_gui_integration
 ```
 
-The test does not connect to an iPhone, invoke `rvictl`, create `rvi0`, or capture live traffic. It supplies deterministic fake `tshark` field output and validates the analysis layer independently.
+The automated tests do not connect to an iPhone, invoke `rvictl`, create `rvi0`, request administrator authorization, or capture live traffic. They validate physical-device readiness parsing, bounded capture requests, Apple PCAP/PCAPNG mode selection, clean termination, post-capture header checks, countdown/finalization state, deterministic `tshark` field output, and the analysis layer independently. Live validation remains an explicit local action because it requires a connected trusted device and native authorization.
 
 The GUI integration test uses the same deterministic field stream to exercise Qt process execution, report loading, and results presentation without displaying a window or requiring live capture.
 
@@ -639,9 +655,12 @@ PASS: analyzer works without rvictl/rvi0
 ```text
 RVI-Sentinel/
 ├── analyze.py
+├── capture_models.py          # typed device and bounded capture contracts
+├── capture_devices.py         # macOS/Linux/Windows device discovery
+├── capture_session.py         # timed platform-aware capture runner
 ├── enrich_endpoints.py        # bounded PTR and local GeoIP enrichment process
 ├── finding_enrichment.py      # address, location, and port explanations
-├── gui.py                     # optional PySide6 analysis desktop UI
+├── gui.py                     # PySide6 capture and analysis desktop UI
 ├── gui_models.py              # typed request/report validation
 ├── capture_rvi.sh             # macOS rvictl/rvi0 capture
 ├── capture_mobile.py          # Linux/Windows frontend
@@ -667,6 +686,7 @@ RVI-Sentinel/
 ├── .gitignore
 ├── tests/
 │   ├── test_analyzer.py
+│   ├── test_capture_models.py
 │   ├── test_finding_enrichment.py
 │   ├── test_gui_integration.py
 │   └── test_gui_models.py
@@ -681,7 +701,7 @@ RVI-Sentinel/
 
 ## Privacy and responsible use
 
-Packet captures can reveal sensitive metadata even when payloads are encrypted. The repository ignores PCAP files, generated reports, local baselines, and the local upstream checkout by default.
+Packet captures and device identifiers can reveal sensitive metadata even when payloads are encrypted. The repository ignores PCAP files, generated reports, local baselines, and the local upstream checkout by default. The GUI keeps capture files and device identifiers local and does not upload them.
 
 Endpoint geolocation uses only the local `.mmdb` file selected by the user. RVI-Sentinel does not send captures, reports, DNS names, SNI values, or endpoint lists to a geolocation web API. PTR hostname resolution does query the Mac's configured DNS resolver for each observed endpoint.
 
@@ -700,7 +720,7 @@ This repository keeps capture provenance, analysis output, and interpretation se
 | **Packet evidence** | PCAP or PCAPNG files remain independent inputs that can be retained and re-analyzed. |
 | **Current findings** | JSON and CSV exports describe the supplied capture. |
 | **Historical context** | The persistent baseline records first seen, last seen, counts, and capture membership. |
-| **Verification evidence** | `tests/test_analyzer.py` validates the analysis layer deterministically; the screenshot above records a passing run. |
+| **Verification evidence** | `tests/test_capture_models.py` validates discovery/capture contracts without a device; `tests/test_analyzer.py` validates analysis deterministically; the screenshot above records a passing analyzer run. |
 
 Live device capture depends on the host OS, USB trust state, and the platform-specific prerequisites documented above. The deterministic test verifies the analysis pipeline, not a live macOS, Linux, or Windows device session.
 

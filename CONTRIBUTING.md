@@ -44,8 +44,9 @@ The analyzer requires `tshark`. Live capture has additional platform-specific pr
 Run the checks relevant to your change. For a complete analyzer and GUI change, run:
 
 ```bash
-python3 -m py_compile analyze.py gui.py gui_models.py enrich_endpoints.py finding_enrichment.py
+python3 -m py_compile analyze.py capture_models.py capture_devices.py capture_session.py capture_mobile.py gui.py gui_models.py enrich_endpoints.py finding_enrichment.py
 python3 tests/test_analyzer.py
+venv/bin/python -m tests.test_capture_models
 venv/bin/python -m tests.test_gui_models
 venv/bin/python -m tests.test_finding_enrichment
 QT_QPA_PLATFORM=offscreen venv/bin/python -m tests.test_gui_integration

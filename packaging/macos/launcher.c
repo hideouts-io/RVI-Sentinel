@@ -34,12 +34,26 @@ int main(int argument_count, char *arguments[]) {
     }
 
     char project_directory[PATH_MAX];
-    if (realpath(executable_path, project_directory) == NULL) {
-        fprintf(stderr, "RVI-Sentinel launcher error: realpath failed: %s\n", strerror(errno));
-        return EXIT_FAILURE;
-    }
-    for (int level = 0; level < 5; level += 1) {
-        parent_directory(project_directory);
+    int first_forwarded_argument = 1;
+    if (argument_count >= 3 && strcmp(arguments[1], "--project-dir") == 0) {
+        if (realpath(arguments[2], project_directory) == NULL) {
+            fprintf(
+                stderr,
+                "RVI-Sentinel launcher error: project path could not be resolved: %s: %s\n",
+                arguments[2],
+                strerror(errno)
+            );
+            return EXIT_FAILURE;
+        }
+        first_forwarded_argument = 3;
+    } else {
+        if (realpath(executable_path, project_directory) == NULL) {
+            fprintf(stderr, "RVI-Sentinel launcher error: realpath failed: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
+        for (int level = 0; level < 5; level += 1) {
+            parent_directory(project_directory);
+        }
     }
 
     char python_path[PATH_MAX];
@@ -65,14 +79,15 @@ int main(int argument_count, char *arguments[]) {
         return EXIT_FAILURE;
     }
 
-    char **python_arguments = calloc((size_t)argument_count + 2, sizeof(char *));
+    int forwarded_argument_count = argument_count - first_forwarded_argument;
+    char **python_arguments = calloc((size_t)forwarded_argument_count + 3, sizeof(char *));
     if (python_arguments == NULL) {
         fail("could not allocate the Python argument list");
     }
     python_arguments[0] = python_path;
     python_arguments[1] = gui_path;
-    for (int index = 1; index < argument_count; index += 1) {
-        python_arguments[index + 1] = arguments[index];
+    for (int index = first_forwarded_argument; index < argument_count; index += 1) {
+        python_arguments[index - first_forwarded_argument + 2] = arguments[index];
     }
 
     execv(python_path, python_arguments);

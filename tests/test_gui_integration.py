@@ -12,6 +12,14 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PySide6.QtCore import QEventLoop, QProcess, QTimer
 from PySide6.QtWidgets import QApplication, QLabel
 
+from capture_models import (
+    CAPTURE_AUTHORIZATION_EVENT,
+    CAPTURE_PREFLIGHT_EVENT,
+    CAPTURE_STARTED_EVENT,
+    CAPTURE_VALIDATED_EVENT,
+    CaptureRequest,
+    DeviceInfo,
+)
 from gui import RviSentinelWindow
 from tests.test_analyzer import FAKE_TSHARK
 
@@ -37,9 +45,48 @@ def main() -> None:
         try:
             window = RviSentinelWindow()
             assert window.windowIcon().isNull() is False
+            assert window.workspace_tabs.count() == 2
+            assert window.workspace_tabs.tabText(0) == "Capture iPhone/iPad"
+            assert window.workspace_tabs.tabText(1) == "Analyze Capture"
+            assert window.device_table.columnCount() == 4
+            assert window.new_capture_button.objectName() == "newCaptureButton"
             logo = window.findChild(QLabel, "applicationLogo")
             assert logo is not None
             assert logo.pixmap().isNull() is False
+            capture_request = CaptureRequest(
+                device=DeviceInfo(
+                    name="Research iPhone",
+                    udid="00008150-000000000000001C",
+                    operating_system="iPhone 17 Pro • iOS 26.3.1 (iPhone18,1)",
+                    status="Ready — paired over USB",
+                    connected=True,
+                ),
+                output_path=temporary_root / "countdown-test.pcap",
+                duration_seconds=30,
+                capture_format="pcap",
+                analyze_after_capture=False,
+            )
+            window.active_capture_request = capture_request
+            window.handle_capture_event(CAPTURE_AUTHORIZATION_EVENT)
+            assert window.capture_timer.isActive() is False
+            assert window.capture_progress.maximum() == 0
+            window.handle_capture_event(CAPTURE_PREFLIGHT_EVENT)
+            assert window.capture_timer.isActive() is False
+            assert "five seconds" in window.capture_status_label.text()
+            window.handle_capture_event(CAPTURE_STARTED_EVENT)
+            assert window.capture_timer.isActive() is True
+            assert window.capture_progress.maximum() == 30
+            assert "Live packets verified" in window.capture_status_label.text()
+            window.capture_elapsed_seconds = 29
+            window.advance_capture_progress()
+            assert window.capture_timer.isActive() is False
+            assert "Finalizing" in window.capture_progress.text()
+            window.handle_capture_event(CAPTURE_VALIDATED_EVENT)
+            assert window.capture_progress.text() == "Capture validated"
+            assert "readable packets" in window.capture_status_label.text()
+            window.capture_timer.stop()
+            window.active_capture_request = None
+            window.capture_countdown_started = False
             window.capture_field.setText(str(capture))
             window.baseline_field.setText(str(baseline))
             window.export_field.setText(str(exports))
@@ -116,6 +163,8 @@ def main() -> None:
     application.quit()
     print("PASS: headless GUI startup")
     print("PASS: application icon and visible logo")
+    print("PASS: separate guided capture and analysis workspaces")
+    print("PASS: countdown begins only after authorization and live-packet preflight")
     print("PASS: GUI-to-analyzer process execution")
     print("PASS: generated report loading")
     print("PASS: summary and findings table population")
