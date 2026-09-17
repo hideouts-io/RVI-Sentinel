@@ -17,6 +17,7 @@ CAPTURE_AUTHORIZATION_EVENT = "RVI_SENTINEL_EVENT authorization_requested"
 CAPTURE_PREFLIGHT_EVENT = "RVI_SENTINEL_EVENT preflight_started"
 CAPTURE_STARTED_EVENT = "RVI_SENTINEL_EVENT capture_started"
 CAPTURE_VALIDATED_EVENT = "RVI_SENTINEL_EVENT capture_validated"
+CAPTURE_NO_TRAFFIC_EVENT = "RVI_SENTINEL_EVENT no_traffic"
 IOS_DEVICE_NAME = re.compile(r"\b(iPhone|iPad|iPod)\b", re.IGNORECASE)
 DEVICE_LINE = re.compile(
     r"^(?P<name>.+?) \((?P<version>[^()]*)\)(?: - (?P<state>[^()]+))? "
@@ -112,7 +113,13 @@ def parse_devicectl_devices(payload: str) -> tuple[DeviceInfo, ...]:
         os_version = require_string(
             properties, "osVersionNumber", f"{context}.deviceProperties"
         )
-        boot_state = require_string(properties, "bootState", f"{context}.deviceProperties")
+        boot_state_value = properties.get("bootState")
+        if isinstance(boot_state_value, str) and boot_state_value.strip():
+            boot_state = boot_state_value.strip()
+        elif isinstance(properties.get("bootedFromSnapshot"), bool):
+            boot_state = "booted" if properties["bootedFromSnapshot"] else "not booted"
+        else:
+            boot_state = "unknown"
         udid = require_string(hardware, "udid", f"{context}.hardwareProperties")
         model = require_string(
             hardware, "marketingName", f"{context}.hardwareProperties"
@@ -123,8 +130,11 @@ def parse_devicectl_devices(payload: str) -> tuple[DeviceInfo, ...]:
         pairing_state = require_string(
             connection, "pairingState", f"{context}.connectionProperties"
         )
-        transport = require_string(
-            connection, "transportType", f"{context}.connectionProperties"
+        transport_value = connection.get("transportType")
+        transport = (
+            transport_value.strip()
+            if isinstance(transport_value, str) and transport_value.strip()
+            else "unavailable"
         )
         visibility = require_string(row, "visibilityClass", context)
         ready = (

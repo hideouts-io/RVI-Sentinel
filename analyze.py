@@ -241,6 +241,41 @@ def write_csv(path: Path, header: List[str], rows: Iterable[Iterable]):
         writer.writerow(header)
         writer.writerows(rows)
 
+def write_report(report: dict, pcap: Path, export_dir: Path) -> Path:
+    export_dir.mkdir(parents=True, exist_ok=True)
+    stem = pcap.stem
+    report_path = export_dir / f"{stem}_report.json"
+    with report_path.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    write_csv(export_dir / f"{stem}_endpoints.csv", ["endpoint", "packets"], report["top_endpoints"])
+    write_csv(export_dir / f"{stem}_dns.csv", ["domain", "queries"], report["top_domains"])
+    write_csv(export_dir / f"{stem}_tls_sni.csv", ["hostname", "observations"], report["top_tls_sni"])
+    return report_path
+
+def print_summary(report: dict, report_path: Path, baseline_path: Path, top: int) -> None:
+    s = report["summary"]
+    c = report["capture"]
+    print(f"Capture: {c['path']}")
+    print(f"Packets: {c['packet_count']}")
+    print(f"Duration: {c['duration_seconds']} seconds")
+    print(f"Unique endpoints: {s['unique_endpoints']} ({len(s['new_endpoints'])} new)")
+    print(f"Unique DNS names: {s['unique_dns_queries']} ({len(s['new_domains'])} new)")
+    print(f"Unique TLS SNI: {s['unique_tls_sni']} ({len(s['new_tls_sni'])} new)")
+    print(f"QUIC-like packets: {s['quic_like_packets']}")
+    print(f"Report: {report_path}")
+    print(f"Baseline: {baseline_path}")
+
+    if top > 0:
+        print("\nTop endpoints:")
+        for key, count in report["top_endpoints"][:top]:
+            marker = " NEW" if key in s["new_endpoints"] else ""
+            print(f"  {count:>8}  {key}{marker}")
+
+        print("\nTop DNS:")
+        for key, count in report["top_domains"][:top]:
+            marker = " NEW" if key in s["new_domains"] else ""
+            print(f"  {count:>8}  {key}{marker}")
+
 def main():
     parser = argparse.ArgumentParser(description="RVI-Sentinel persistent PCAP/PCAPNG metadata analyzer using tshark.")
     parser.add_argument("pcap", type=Path, help="PCAP or PCAPNG file")
@@ -257,42 +292,10 @@ def main():
     report = analyze(args.pcap, baseline, args.entropy_threshold)
 
     args.baseline.parent.mkdir(parents=True, exist_ok=True)
-    args.export_dir.mkdir(parents=True, exist_ok=True)
-
     with args.baseline.open("w", encoding="utf-8") as fh:
         json.dump(baseline, fh, indent=2, sort_keys=True)
-
-    stem = args.pcap.stem
-    report_path = args.export_dir / f"{stem}_report.json"
-    with report_path.open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2, sort_keys=True)
-
-    write_csv(args.export_dir / f"{stem}_endpoints.csv", ["endpoint", "packets"], report["top_endpoints"])
-    write_csv(args.export_dir / f"{stem}_dns.csv", ["domain", "queries"], report["top_domains"])
-    write_csv(args.export_dir / f"{stem}_tls_sni.csv", ["hostname", "observations"], report["top_tls_sni"])
-
-    s = report["summary"]
-    c = report["capture"]
-    print(f"Capture: {c['path']}")
-    print(f"Packets: {c['packet_count']}")
-    print(f"Duration: {c['duration_seconds']} seconds")
-    print(f"Unique endpoints: {s['unique_endpoints']} ({len(s['new_endpoints'])} new)")
-    print(f"Unique DNS names: {s['unique_dns_queries']} ({len(s['new_domains'])} new)")
-    print(f"Unique TLS SNI: {s['unique_tls_sni']} ({len(s['new_tls_sni'])} new)")
-    print(f"QUIC-like packets: {s['quic_like_packets']}")
-    print(f"Report: {report_path}")
-    print(f"Baseline: {args.baseline}")
-
-    if args.top > 0:
-        print("\nTop endpoints:")
-        for key, count in report["top_endpoints"][:args.top]:
-            marker = " NEW" if key in s["new_endpoints"] else ""
-            print(f"  {count:>8}  {key}{marker}")
-
-        print("\nTop DNS:")
-        for key, count in report["top_domains"][:args.top]:
-            marker = " NEW" if key in s["new_domains"] else ""
-            print(f"  {count:>8}  {key}{marker}")
+    report_path = write_report(report, args.pcap, args.export_dir)
+    print_summary(report, report_path, args.baseline, args.top)
 
 if __name__ == "__main__":
     main()

@@ -7,10 +7,14 @@ import shlex
 import shutil
 import sys
 import platform
+import hashlib
+import json
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
+from PySide6.QtCore import QLockFile, QProcess, QProcessEnvironment, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -66,6 +70,7 @@ from capture_models import (
     CAPTURE_PREFLIGHT_EVENT,
     CAPTURE_STARTED_EVENT,
     CAPTURE_VALIDATED_EVENT,
+    CAPTURE_NO_TRAFFIC_EVENT,
     CaptureRequest,
     CaptureValidationError,
     DeviceInfo,
@@ -83,14 +88,32 @@ from finding_enrichment import (
 
 ROOT = Path(__file__).resolve().parent
 ANALYZER = ROOT / "analyze.py"
+ANALYZER_PREVIEW = ROOT / "analyze_preview.py"
+SETUP_CHECKS = ROOT / "setup_checks.py"
+CAPTURE_STATS = ROOT / "capture_stats.py"
 ENDPOINT_ENRICHER = ROOT / "enrich_endpoints.py"
 DEVICE_DISCOVERY = ROOT / "capture_devices.py"
 CAPTURE_SESSION = ROOT / "capture_session.py"
 CAPTURE_SUPPORT_SETUP = ROOT / "scripts" / "setup_rvi_capture.py"
-DEFAULT_BASELINE = ROOT / "data" / "findings_master.json"
 DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
 DEFAULT_CAPTURE_DIRECTORY = ROOT / "captures"
 APP_ICON = ROOT / "assets" / "rvi-sentinel-logo.png"
+GUI_INSTANCE_LOCK = Path(tempfile.gettempdir()) / "rvi-sentinel-gui.lock"
+
+
+class GuiInstanceAlreadyRunningError(RuntimeError):
+    """Raised when another RVI-Sentinel GUI process owns the instance lock."""
+
+
+def acquire_gui_instance_lock(path: Path) -> QLockFile:
+    lock = QLockFile(str(path))
+    lock.setStaleLockTime(30_000)
+    if not lock.tryLock(0):
+        raise GuiInstanceAlreadyRunningError(
+            "Another RVI-Sentinel window is already running. Close the existing window "
+            "before launching a new build."
+        )
+    return lock
 
 
 def load_application_icon(path: Path) -> QIcon:
@@ -112,7 +135,6 @@ class CaptureSetupDialog(QDialog):
         self.duration_field = QSpinBox()
         self.format_field = QComboBox()
         self.output_field = QLineEdit()
-        self.analyze_field = QCheckBox("Analyze automatically when the capture finishes")
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
         )
@@ -169,9 +191,6 @@ class CaptureSetupDialog(QDialog):
         output_button = QPushButton("Choose…")
         output_button.setObjectName("captureOutputBrowseButton")
 
-        self.analyze_field.setChecked(True)
-        self.analyze_field.setObjectName("analyzeAfterCaptureField")
-
         form.addWidget(QLabel("Device"), 0, 0)
         form.addWidget(self.device_field, 0, 1, 1, 2)
         form.addWidget(QLabel("Duration"), 1, 0)
@@ -181,7 +200,6 @@ class CaptureSetupDialog(QDialog):
         form.addWidget(QLabel("Save capture as"), 3, 0)
         form.addWidget(self.output_field, 3, 1)
         form.addWidget(output_button, 3, 2)
-        form.addWidget(self.analyze_field, 4, 1, 1, 2)
         layout.addWidget(form_group)
 
         permission_note = QLabel(capture_permission_note(platform.system()))
@@ -229,7 +247,7 @@ class CaptureSetupDialog(QDialog):
             output_path=Path(output_text).expanduser().resolve(),
             duration_seconds=self.duration_field.value(),
             capture_format=self.format_field.currentText(),
-            analyze_after_capture=self.analyze_field.isChecked(),
+            analyze_after_capture=False,
         )
         validate_capture_request(request)
         return request
@@ -277,6 +295,8 @@ class RviSentinelWindow(QMainWindow):
         self.device_process = QProcess(self)
         self.capture_process = QProcess(self)
         self.setup_process = QProcess(self)
+        self.check_process = QProcess(self)
+        self.stats_process = QProcess(self)
         self.enrichment_timer = QTimer(self)
         self.enrichment_timer.setSingleShot(True)
         self.capture_timer = QTimer(self)
@@ -291,9 +311,19 @@ class RviSentinelWindow(QMainWindow):
         self.capture_event_buffer = ""
         self.capture_error_buffer = ""
         self.capture_cancel_requested = False
+        self.capture_no_traffic = False
+        self.capture_started_at: float | None = None
+        self.capture_actual_seconds: float | None = None
+        self.last_capture_request: CaptureRequest | None = None
+        self.completed_capture_path: Path | None = None
+        self.preview_request: AnalysisRequest | None = None
+        self.updating_baseline = False
+        self.manual_baseline_selected = False
+        self.setup_check_results: list[tuple[str, bool]] = []
         self.summary_labels: dict[str, QLabel] = {}
 
         self.workspace_tabs = QTabWidget()
+        self.results_tabs = QTabWidget()
         self.device_table = create_device_table()
         self.capture_status_label = QLabel("Connect and unlock an iPhone or iPad, then refresh devices.")
         self.capture_progress = QProgressBar()
@@ -302,9 +332,20 @@ class RviSentinelWindow(QMainWindow):
         self.new_capture_button = QPushButton("New Capture…")
         self.cancel_capture_button = QPushButton("Cancel Capture")
         self.install_capture_support_button = QPushButton("Install Capture Support")
+        self.retry_traffic_button = QPushButton("Retry Traffic Check")
+        self.advanced_toggle = QCheckBox("Advanced details")
+        self.copy_diagnostics_button = QPushButton("Copy diagnostics")
+        self.completion_group = QGroupBox("Capture complete")
+        self.completion_summary = QLabel()
+        self.completion_analyze_button = QPushButton("Analyze without updating baseline")
+        self.completion_location_button = QPushButton("Open file location")
+        self.completion_again_button = QPushButton("Capture again")
+        self.check_button = QPushButton("Run setup checks")
+        self.check_table = QTableWidget(0, 3)
+        self.check_status = QLabel("Run checks before capturing.")
 
         self.capture_field = QLineEdit()
-        self.baseline_field = QLineEdit(str(DEFAULT_BASELINE))
+        self.baseline_field = QLineEdit()
         self.export_field = QLineEdit(str(DEFAULT_EXPORT_DIRECTORY))
         self.geoip_field = QLineEdit()
         self.entropy_field = QDoubleSpinBox()
@@ -314,6 +355,7 @@ class RviSentinelWindow(QMainWindow):
         self.console = QTextEdit()
         self.interpretation = QTextEdit()
         self.analyze_button = QPushButton("Analyze Capture")
+        self.add_to_baseline_button = QPushButton("Add findings to baseline")
         self.open_exports_button = QPushButton("Open Export Folder")
 
         self.endpoints_table = create_endpoint_table()
@@ -325,6 +367,7 @@ class RviSentinelWindow(QMainWindow):
 
         self.configure_window()
         self.build_interface()
+        self.set_advanced_details_visible(False)
         self.connect_signals()
         self.refresh_command_preview()
         QTimer.singleShot(0, self.refresh_devices)
@@ -441,6 +484,10 @@ class RviSentinelWindow(QMainWindow):
         header_layout.addWidget(logo)
         header_layout.addLayout(title_layout)
         header_layout.addStretch(1)
+        self.advanced_toggle.setObjectName("advancedDetailsToggle")
+        self.copy_diagnostics_button.setObjectName("copyDiagnosticsButton")
+        header_layout.addWidget(self.advanced_toggle)
+        header_layout.addWidget(self.copy_diagnostics_button)
 
         scope = QLabel(
             "A new endpoint or hostname is a change to investigate, not proof of malicious activity. "
@@ -458,6 +505,7 @@ class RviSentinelWindow(QMainWindow):
         self.workspace_tabs.setDocumentMode(True)
         self.workspace_tabs.addTab(self.create_capture_workspace(), "Capture iPhone/iPad")
         self.workspace_tabs.addTab(self.create_analysis_workspace(), "Analyze Capture")
+        self.workspace_tabs.addTab(self.create_setup_workspace(), "Check setup")
         self.workspace_tabs.setCurrentIndex(0)
         root_layout.addWidget(self.workspace_tabs, 1)
 
@@ -499,6 +547,9 @@ class RviSentinelWindow(QMainWindow):
         device_actions.addWidget(self.new_capture_button)
         device_actions.addWidget(self.cancel_capture_button)
         device_actions.addWidget(self.install_capture_support_button)
+        self.retry_traffic_button.setObjectName("retryTrafficButton")
+        self.retry_traffic_button.setVisible(False)
+        device_actions.addWidget(self.retry_traffic_button)
         device_actions.addStretch(1)
         device_layout.addLayout(device_actions)
         layout.addWidget(device_group, 2)
@@ -520,8 +571,23 @@ class RviSentinelWindow(QMainWindow):
         self.capture_console.setFont(console_font)
         progress_layout.addWidget(self.capture_status_label)
         progress_layout.addWidget(self.capture_progress)
+        self.capture_console.setVisible(False)
         progress_layout.addWidget(self.capture_console, 1)
         layout.addWidget(progress_group, 1)
+
+        completion_layout = QVBoxLayout(self.completion_group)
+        self.completion_group.setObjectName("captureCompletionCard")
+        self.completion_summary.setObjectName("captureCompletionSummary")
+        self.completion_summary.setWordWrap(True)
+        self.completion_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        completion_layout.addWidget(self.completion_summary)
+        completion_actions = QHBoxLayout()
+        for button in (self.completion_analyze_button, self.completion_location_button, self.completion_again_button):
+            completion_actions.addWidget(button)
+        completion_actions.addStretch(1)
+        completion_layout.addLayout(completion_actions)
+        self.completion_group.setVisible(False)
+        layout.addWidget(self.completion_group)
 
         privacy = QLabel(
             "Captures stay at the local path you choose. Only capture files you are authorized "
@@ -533,6 +599,35 @@ class RviSentinelWindow(QMainWindow):
             "border-radius: 4px; padding: 9px; color: #bbf7d0;"
         )
         layout.addWidget(privacy)
+        return page
+
+    def create_setup_workspace(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        explanation = QLabel(
+            "Check the selected phone and this computer before capturing. On a Chromebook, "
+            "share the USB device with Linux in Settings > Developers > Linux > USB preferences. "
+            "USB forwarding support can vary by device. "
+            '<a href="https://developers.google.com/chromeos/app-development/develop/linux-on-chromeos-faq">'
+            "ChromeOS Linux USB guidance</a>."
+        )
+        explanation.setWordWrap(True)
+        explanation.setOpenExternalLinks(True)
+        layout.addWidget(explanation)
+        self.check_button.setObjectName("runSetupChecksButton")
+        layout.addWidget(self.check_button)
+        self.check_status.setObjectName("setupCheckStatus")
+        layout.addWidget(self.check_status)
+        self.check_table.setObjectName("setupCheckTable")
+        self.check_table.setHorizontalHeaderLabels(("Check", "Result", "What to do"))
+        self.check_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.check_table.setWordWrap(True)
+        self.check_table.verticalHeader().setVisible(False)
+        self.check_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.check_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.check_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.check_table, 1)
         return page
 
     def create_analysis_workspace(self) -> QWidget:
@@ -604,7 +699,10 @@ class RviSentinelWindow(QMainWindow):
         layout.addWidget(self.entropy_field, 4, 1)
         layout.addWidget(QLabel("Console top count"), 4, 2)
         layout.addWidget(self.top_field, 4, 3)
-        layout.addWidget(QLabel("Exact command"), 5, 0)
+        self.command_label = QLabel("Exact command")
+        self.command_label.setVisible(False)
+        self.command_field.setVisible(False)
+        layout.addWidget(self.command_label, 5, 0)
         layout.addWidget(self.command_field, 5, 1, 1, 3)
 
         capture_button.clicked.connect(self.choose_capture)
@@ -615,13 +713,17 @@ class RviSentinelWindow(QMainWindow):
 
     def create_action_row(self) -> QHBoxLayout:
         layout = QHBoxLayout()
+        self.analyze_button.setText("Analyze without updating baseline")
         self.analyze_button.setObjectName("analyzeButton")
+        self.add_to_baseline_button.setObjectName("addToBaselineButton")
+        self.add_to_baseline_button.setEnabled(False)
         self.open_exports_button.setObjectName("openExportsButton")
         self.open_exports_button.setEnabled(DEFAULT_EXPORT_DIRECTORY.exists())
         clear_button = QPushButton("Clear Results")
         clear_button.setObjectName("clearResultsButton")
 
         self.analyze_button.clicked.connect(self.start_analysis)
+        self.add_to_baseline_button.clicked.connect(self.add_findings_to_baseline)
         self.open_exports_button.clicked.connect(self.open_export_directory)
         clear_button.clicked.connect(self.clear_results)
 
@@ -632,6 +734,7 @@ class RviSentinelWindow(QMainWindow):
         )
 
         layout.addWidget(self.analyze_button)
+        layout.addWidget(self.add_to_baseline_button)
         layout.addWidget(self.open_exports_button)
         layout.addWidget(clear_button)
         layout.addStretch(1)
@@ -639,7 +742,7 @@ class RviSentinelWindow(QMainWindow):
         return layout
 
     def create_results_tabs(self) -> QTabWidget:
-        tabs = QTabWidget()
+        tabs = self.results_tabs
         tabs.setDocumentMode(True)
         tabs.addTab(self.create_summary_tab(), "Summary")
         self.interpretation.setReadOnly(True)
@@ -705,6 +808,7 @@ class RviSentinelWindow(QMainWindow):
         return widget
 
     def connect_signals(self) -> None:
+        self.capture_field.textChanged.connect(self.suggest_investigation_baseline)
         self.capture_field.textChanged.connect(self.refresh_command_preview)
         self.baseline_field.textChanged.connect(self.refresh_command_preview)
         self.export_field.textChanged.connect(self.refresh_command_preview)
@@ -734,13 +838,102 @@ class RviSentinelWindow(QMainWindow):
         self.setup_process.finished.connect(self.capture_support_finished)
         self.setup_process.errorOccurred.connect(self.capture_support_error)
         self.capture_timer.timeout.connect(self.advance_capture_progress)
+        self.retry_traffic_button.clicked.connect(self.retry_traffic_check)
+        self.advanced_toggle.toggled.connect(self.set_advanced_details_visible)
+        self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
+        self.completion_analyze_button.clicked.connect(self.analyze_completed_capture)
+        self.completion_location_button.clicked.connect(self.open_capture_location)
+        self.completion_again_button.clicked.connect(self.open_capture_dialog)
+        self.check_button.clicked.connect(self.run_setup_checks)
+        self.check_process.finished.connect(self.setup_checks_finished)
+        self.check_process.errorOccurred.connect(self.setup_checks_error)
+        self.stats_process.finished.connect(self.capture_stats_finished)
+        self.stats_process.errorOccurred.connect(self.capture_stats_error)
+
+    def set_advanced_details_visible(self, visible: bool) -> None:
+        self.device_table.setColumnHidden(2, not visible)
+        set_device_identifier_visibility(
+            self.device_table, self.discovered_devices, visible
+        )
+        self.capture_console.setVisible(visible)
+        self.command_field.setVisible(visible)
+        self.command_label.setVisible(visible)
+        console_index = self.results_tabs.indexOf(self.console)
+        if console_index >= 0:
+            self.results_tabs.setTabVisible(console_index, visible)
+
+    def copy_diagnostics(self) -> None:
+        checks = "\n".join(
+            f"{name}: {'PASS' if passed else 'FAIL'}"
+            for name, passed in self.setup_check_results
+        )
+        outcome = "no traffic observed" if self.capture_no_traffic else (
+            "capture completed" if self.completed_capture_path is not None else "not completed"
+        )
+        text = (
+            f"RVI-Sentinel diagnostics\nHost: {platform.system()}\n"
+            f"Capture outcome: {outcome}\nSetup checks:\n{checks or 'not run'}\n"
+            "No device identifiers, packet contents, or private paths are included."
+        )
+        QApplication.clipboard().setText(text)
+        self.capture_status_label.setText("Redacted diagnostics copied to clipboard.")
+
+    def run_setup_checks(self) -> None:
+        if self.check_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        output_path = self.last_capture_request.output_path.parent if self.last_capture_request else DEFAULT_CAPTURE_DIRECTORY
+        arguments = [str(SETUP_CHECKS), "--output-dir", str(output_path)]
+        selected = self.device_table.currentRow()
+        if 0 <= selected < len(self.discovered_devices):
+            arguments.extend(("--udid", self.discovered_devices[selected].udid))
+        self.check_button.setEnabled(False)
+        self.check_status.setText("Checking this computer and the selected phone…")
+        self.check_process.setWorkingDirectory(str(ROOT))
+        self.check_process.setProgram(sys.executable)
+        self.check_process.setArguments(arguments)
+        self.check_process.start()
+
+    def setup_checks_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        self.check_button.setEnabled(True)
+        output = bytes(self.check_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        error = bytes(self.check_process.readAllStandardError()).decode("utf-8", errors="replace")
+        if exit_code != 0:
+            self.check_status.setText(f"Setup check failed: {error.strip() or 'No diagnostics returned.'}")
+            return
+        try:
+            payload: object = json.loads(output)
+            if not isinstance(payload, dict) or not isinstance(payload.get("checks"), list):
+                raise ValueError("Setup checks returned an invalid result structure.")
+            rows = payload["checks"]
+            self.check_table.setRowCount(len(rows))
+            self.setup_check_results = []
+            for index, row in enumerate(rows):
+                if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not isinstance(row.get("passed"), bool) or not isinstance(row.get("detail"), str) or not isinstance(row.get("fix"), str):
+                    raise ValueError(f"Setup check {index} has an invalid result.")
+                name, passed, detail, fix = row["name"], row["passed"], row["detail"], row["fix"]
+                self.setup_check_results.append((name, passed))
+                self.check_table.setItem(index, 0, QTableWidgetItem(name))
+                self.check_table.setItem(index, 1, QTableWidgetItem("PASS" if passed else "FAIL"))
+                self.check_table.setItem(index, 2, QTableWidgetItem(detail if passed else f"{detail}  Fix: {fix}"))
+                self.check_table.resizeRowToContents(index)
+            failed = sum(not passed for _name, passed in self.setup_check_results)
+            self.check_status.setText(f"{len(rows) - failed} passed, {failed} failed. Fix failed checks, then run again.")
+        except (json.JSONDecodeError, ValueError) as error:
+            self.check_status.setText(f"Could not read setup results: {error}")
+
+    def setup_checks_error(self, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.Crashed:
+            return
+        self.check_button.setEnabled(True)
+        self.check_status.setText(f"Could not run setup checks: {self.check_process.errorString()}")
 
     def refresh_devices(self) -> None:
         if self.device_process.state() != QProcess.ProcessState.NotRunning:
             return
         self.refresh_devices_button.setEnabled(False)
         self.new_capture_button.setEnabled(False)
-        self.capture_status_label.setText("Looking for physical iPhone and iPad devices…")
+        if self.completed_capture_path is None:
+            self.capture_status_label.setText("Looking for physical iPhone and iPad devices…")
         self.capture_console.append(f"$ {shlex.join([sys.executable, str(DEVICE_DISCOVERY)])}")
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUNBUFFERED", "1")
@@ -780,7 +973,9 @@ class RviSentinelWindow(QMainWindow):
         self.discovered_devices = devices
         populate_device_table(self.device_table, devices)
         connected_count = sum(1 for device in devices if device.connected)
-        if connected_count:
+        if self.completed_capture_path is not None:
+            self.capture_status_label.setText("Capture complete. The saved file is ready below.")
+        elif connected_count:
             self.capture_status_label.setText(
                 f"Ready: {connected_count} connected iOS device(s) available for capture."
             )
@@ -821,6 +1016,13 @@ class RviSentinelWindow(QMainWindow):
         if self.capture_process.state() != QProcess.ProcessState.NotRunning:
             return
         self.active_capture_request = request
+        self.last_capture_request = request
+        self.completed_capture_path = None
+        self.completion_group.setVisible(False)
+        self.retry_traffic_button.setVisible(False)
+        self.capture_no_traffic = False
+        self.capture_started_at = None
+        self.capture_actual_seconds = None
         self.capture_elapsed_seconds = 0
         self.capture_countdown_started = False
         self.capture_event_buffer = ""
@@ -903,6 +1105,7 @@ class RviSentinelWindow(QMainWindow):
             return
         if event == CAPTURE_STARTED_EVENT and not self.capture_countdown_started:
             self.capture_countdown_started = True
+            self.capture_started_at = time.monotonic()
             self.capture_elapsed_seconds = 0
             self.capture_progress.setRange(0, request.duration_seconds)
             self.capture_progress.setValue(0)
@@ -915,11 +1118,20 @@ class RviSentinelWindow(QMainWindow):
             return
         if event == CAPTURE_VALIDATED_EVENT:
             self.capture_timer.stop()
+            if self.capture_started_at is not None:
+                self.capture_actual_seconds = time.monotonic() - self.capture_started_at
             self.capture_progress.setRange(0, request.duration_seconds)
             self.capture_progress.setValue(request.duration_seconds)
             self.capture_progress.setFormat("Capture validated")
             self.capture_status_label.setText(
                 "Capture file closed successfully and contains readable packets."
+            )
+            return
+        if event == CAPTURE_NO_TRAFFIC_EVENT:
+            self.capture_no_traffic = True
+            self.capture_status_label.setText(
+                "The phone is still connected, but no traffic was observed in five seconds. "
+                "Open a webpage on the phone, then retry the traffic check."
             )
 
     def read_capture_error(self) -> None:
@@ -982,12 +1194,21 @@ class RviSentinelWindow(QMainWindow):
                 )
                 QTimer.singleShot(0, self.refresh_devices)
                 return
+            if self.capture_no_traffic:
+                self.capture_progress.setFormat("No packets observed")
+                self.capture_status_label.setText(
+                    "No packets were observed during the five-second check. Open a webpage "
+                    "on the phone, then choose Retry Traffic Check. The device was not reported disconnected."
+                )
+                self.retry_traffic_button.setVisible(True)
+                return
             self.capture_progress.setFormat("Capture failed")
             backend_detail = self.capture_error_buffer.strip()
-            detail = backend_detail or (
+            raw_detail = backend_detail or (
                 f"Capture failed with exit code {exit_code}, but the backend returned no "
                 "diagnostic output."
             )
+            detail = redact_capture_detail(raw_detail, request)
             self.capture_status_label.setText(detail)
             self.show_error("Capture failed", detail)
             QTimer.singleShot(0, self.refresh_devices)
@@ -1002,13 +1223,89 @@ class RviSentinelWindow(QMainWindow):
         self.capture_progress.setRange(0, request.duration_seconds)
         self.capture_progress.setValue(request.duration_seconds)
         self.capture_progress.setFormat("Capture complete")
-        self.capture_status_label.setText(f"Capture complete: {request.output_path}")
+        self.capture_status_label.setText("Capture complete. The saved file is ready below.")
         self.capture_console.append(f"\nReady to analyze: {request.output_path}")
         self.capture_field.setText(str(request.output_path))
-        self.workspace_tabs.setCurrentIndex(1)
-        if request.analyze_after_capture:
-            QTimer.singleShot(0, self.start_analysis)
+        self.completed_capture_path = request.output_path
+        self.manual_baseline_selected = False
+        self.baseline_field.setText(str(device_baseline_path(request.device)))
+        self.completion_summary.setText(
+            f"Saved location: {request.output_path}\n"
+            f"File size: {format_bytes(request.output_path.stat().st_size)}\n"
+            "Packet count: Checking…\n"
+            f"Actual capture time: {format_duration(self.capture_actual_seconds)}"
+        )
+        self.completion_group.setVisible(True)
+        self.read_capture_stats(request.output_path)
         QTimer.singleShot(0, self.refresh_devices)
+
+    def retry_traffic_check(self) -> None:
+        request = self.last_capture_request
+        if request is None:
+            self.show_error("No capture to retry", "Start a new capture first.")
+            return
+        try:
+            arguments = capture_session_arguments(request, CAPTURE_SESSION)
+        except CaptureValidationError as error:
+            self.show_error("Cannot retry capture", str(error))
+            return
+        self.start_capture(request, arguments)
+
+    def read_capture_stats(self, path: Path) -> None:
+        if self.stats_process.state() != QProcess.ProcessState.NotRunning:
+            self.show_error("Capture statistics busy", "A previous capture statistics check is still running.")
+            return
+        self.stats_process.setWorkingDirectory(str(ROOT))
+        self.stats_process.setProgram(sys.executable)
+        self.stats_process.setArguments([str(CAPTURE_STATS), str(path)])
+        self.stats_process.start()
+
+    def capture_stats_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        path = self.completed_capture_path
+        if path is None:
+            return
+        output = bytes(self.stats_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        error = bytes(self.stats_process.readAllStandardError()).decode("utf-8", errors="replace")
+        if exit_code != 0:
+            packet_text = f"Unavailable ({error.strip() or 'tshark failed'})"
+        else:
+            try:
+                payload: object = json.loads(output)
+                if not isinstance(payload, dict) or not isinstance(payload.get("packet_count"), int):
+                    raise ValueError("Packet count missing from statistics output.")
+                packet_text = f"{payload['packet_count']:,}"
+                duration_value = payload.get("duration_seconds")
+                if isinstance(duration_value, (int, float)):
+                    self.capture_actual_seconds = float(duration_value)
+            except (json.JSONDecodeError, ValueError) as parse_error:
+                packet_text = f"Unavailable ({parse_error})"
+        self.completion_summary.setText(
+            f"Saved location: {path}\nFile size: {format_bytes(path.stat().st_size)}\n"
+            f"Packet count: {packet_text}\n"
+            f"Actual capture time: {format_duration(self.capture_actual_seconds)}"
+        )
+
+    def capture_stats_error(self, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.Crashed:
+            return
+        self.capture_status_label.setText(
+            f"Capture saved, but packet counting could not start: {self.stats_process.errorString()}"
+        )
+
+    def analyze_completed_capture(self) -> None:
+        if self.completed_capture_path is None:
+            self.show_error("No completed capture", "Complete a capture before analyzing it.")
+            return
+        self.workspace_tabs.setCurrentIndex(1)
+        self.start_analysis()
+
+    def open_capture_location(self) -> None:
+        if self.completed_capture_path is None:
+            self.show_error("No completed capture", "Complete a capture first.")
+            return
+        directory = self.completed_capture_path.parent
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+            self.show_error("Could not open file location", str(directory))
 
     def capture_process_error(self, error: QProcess.ProcessError) -> None:
         detail = f"Could not run the capture helper: {error.name}"
@@ -1089,7 +1386,14 @@ class RviSentinelWindow(QMainWindow):
             "JSON files (*.json);;All files (*)",
         )
         if selected:
+            self.manual_baseline_selected = True
             self.baseline_field.setText(selected)
+
+    def suggest_investigation_baseline(self, capture_text: str) -> None:
+        if not capture_text.strip() or self.manual_baseline_selected:
+            return
+        path = Path(capture_text).expanduser().resolve()
+        self.baseline_field.setText(str(investigation_baseline_path(path)))
 
     def choose_export_directory(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -1143,7 +1447,7 @@ class RviSentinelWindow(QMainWindow):
         try:
             request = self.current_request()
             self.current_geoip_database()
-            arguments = analyzer_arguments(request, ANALYZER)
+            arguments = analyzer_arguments(request, ANALYZER_PREVIEW)
             command = shlex.join([sys.executable, *arguments])
         except RequestValidationError:
             command = (
@@ -1158,12 +1462,15 @@ class RviSentinelWindow(QMainWindow):
             return
         try:
             request = self.current_request()
-            arguments = analyzer_arguments(request, ANALYZER)
+            arguments = analyzer_arguments(request, ANALYZER_PREVIEW)
         except RequestValidationError as error:
             self.show_error("Invalid analysis configuration", str(error))
             return
 
         self.active_request = request
+        self.preview_request = None
+        self.updating_baseline = False
+        self.add_to_baseline_button.setEnabled(False)
         self.cancel_endpoint_enrichment()
         self.clear_results()
         self.active_report_path = None
@@ -1178,6 +1485,40 @@ class RviSentinelWindow(QMainWindow):
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUNBUFFERED", "1")
         self.process.setProcessEnvironment(environment)
+        self.process.setWorkingDirectory(str(ROOT))
+        self.process.setProgram(sys.executable)
+        self.process.setArguments(arguments)
+        self.process.start()
+
+    def add_findings_to_baseline(self) -> None:
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            return
+        try:
+            request = self.current_request()
+            if request != self.preview_request:
+                raise RequestValidationError(
+                    "Capture, baseline, or analysis settings changed. Run read-only analysis again first."
+                )
+            arguments = analyzer_arguments(request, ANALYZER)
+        except RequestValidationError as error:
+            self.show_error("Cannot update baseline", str(error))
+            return
+        decision = QMessageBox.question(
+            self,
+            "Update this baseline?",
+            f"Add findings from {request.capture_path.name} to this baseline?\n\n"
+            f"{request.baseline_path}\n\nThis changes the selected baseline file.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+        self.active_request = request
+        self.updating_baseline = True
+        self.add_to_baseline_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.console.append("\nAdding findings to the selected baseline…\n")
+        self.status_label.setText("Updating the selected baseline…")
         self.process.setWorkingDirectory(str(ROOT))
         self.process.setProgram(sys.executable)
         self.process.setArguments(arguments)
@@ -1199,6 +1540,8 @@ class RviSentinelWindow(QMainWindow):
         self.read_standard_output()
         self.read_standard_error()
         self.analyze_button.setEnabled(True)
+        updating_baseline = self.updating_baseline
+        self.updating_baseline = False
 
         request = self.active_request
         self.active_request = None
@@ -1222,9 +1565,19 @@ class RviSentinelWindow(QMainWindow):
             return
 
         self.active_report_path = report_path
+        if updating_baseline:
+            self.preview_request = None
+            self.add_to_baseline_button.setEnabled(False)
+        else:
+            self.preview_request = request
+            self.add_to_baseline_button.setEnabled(True)
         self.populate_report(report)
         self.start_endpoint_enrichment(report.endpoints)
         self.open_exports_button.setEnabled(True)
+        if updating_baseline:
+            self.status_label.setText(f"Findings added to baseline: {request.baseline_path}")
+        else:
+            self.status_label.setText("Read-only analysis complete. Baseline unchanged; review findings before adding them.")
 
     def process_error(self, error: QProcess.ProcessError) -> None:
         if error == QProcess.ProcessError.Crashed:
@@ -1367,10 +1720,16 @@ class RviSentinelWindow(QMainWindow):
 
     def completed_status(self, detail: str) -> str:
         report = str(self.active_report_path) if self.active_report_path else "not available"
-        return f"Analysis complete. {detail} Report: {report}"
+        baseline_state = (
+            "Baseline unchanged until you choose Add findings."
+            if self.preview_request is not None else "Selected baseline was updated."
+        )
+        return f"Analysis complete. {baseline_state} {detail} Report: {report}"
 
     def clear_results(self) -> None:
         self.cancel_endpoint_enrichment()
+        self.preview_request = None
+        self.add_to_baseline_button.setEnabled(False)
         for label in self.summary_labels.values():
             label.setText("—")
         for table in (
@@ -1431,6 +1790,8 @@ class RviSentinelWindow(QMainWindow):
             self.device_process,
             self.capture_process,
             self.setup_process,
+            self.check_process,
+            self.stats_process,
         ):
             if process.state() != QProcess.ProcessState.NotRunning:
                 process.terminate()
@@ -1448,6 +1809,28 @@ def capture_backend_summary(host_system: str) -> str:
     return "unsupported capture host"
 
 
+def device_baseline_path(device: DeviceInfo) -> Path:
+    fingerprint = hashlib.sha256(device.udid.encode("utf-8")).hexdigest()[:12]
+    return ROOT / "data" / "baselines" / f"device-{fingerprint}.json"
+
+
+def redact_capture_detail(detail: str, request: CaptureRequest) -> str:
+    redacted = detail.replace(request.device.udid, "[device identifier redacted]")
+    redacted = redacted.replace(str(request.output_path), "[capture path redacted]")
+    redacted = redacted.replace(str(ROOT), "[project path redacted]")
+    redacted = re.sub(
+        r"\b(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16})\b",
+        "[device identifier redacted]",
+        redacted,
+    )
+    return redacted
+
+
+def investigation_baseline_path(capture: Path) -> Path:
+    fingerprint = hashlib.sha256(str(capture).encode("utf-8")).hexdigest()[:12]
+    return ROOT / "data" / "baselines" / f"investigation-{fingerprint}.json"
+
+
 def create_device_table() -> QTableWidget:
     table = QTableWidget(0, 4)
     table.setHorizontalHeaderLabels(("Device", "OS / model", "Device identifier", "Status"))
@@ -1455,6 +1838,7 @@ def create_device_table() -> QTableWidget:
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setAlternatingRowColors(True)
+    table.setSortingEnabled(False)
     table.verticalHeader().setVisible(False)
     table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1463,19 +1847,63 @@ def create_device_table() -> QTableWidget:
     return table
 
 
+def device_table_matches(
+    table: QTableWidget, devices: tuple[DeviceInfo, ...]
+) -> bool:
+    if table.rowCount() != len(devices):
+        return False
+    for row_index, device in enumerate(devices):
+        name_item = table.item(row_index, 0)
+        operating_system_item = table.item(row_index, 1)
+        status_item = table.item(row_index, 3)
+        if (
+            name_item is None
+            or operating_system_item is None
+            or status_item is None
+            or name_item.data(Qt.ItemDataRole.UserRole) != device.udid
+            or name_item.text() != device.name
+            or operating_system_item.text() != device.operating_system
+            or status_item.text() != device.status
+        ):
+            return False
+    return True
+
+
+def set_device_identifier_visibility(
+    table: QTableWidget, devices: tuple[DeviceInfo, ...], visible: bool
+) -> None:
+    for row_index, device in enumerate(devices):
+        identifier_item = table.item(row_index, 2)
+        if identifier_item is not None:
+            identifier_item.setText(device.udid if visible else "Hidden")
+
+
 def populate_device_table(
     table: QTableWidget, devices: tuple[DeviceInfo, ...]
 ) -> None:
-    table.setSortingEnabled(False)
+    if device_table_matches(table, devices):
+        return
+    current_row = table.currentRow()
     table.setRowCount(len(devices))
     for row_index, device in enumerate(devices):
-        status_item = QTableWidgetItem(device.status)
+        name_item = table.item(row_index, 0) or QTableWidgetItem()
+        operating_system_item = table.item(row_index, 1) or QTableWidgetItem()
+        identifier_item = table.item(row_index, 2) or QTableWidgetItem()
+        status_item = table.item(row_index, 3) or QTableWidgetItem()
+        name_item.setText(device.name)
+        name_item.setData(Qt.ItemDataRole.UserRole, device.udid)
+        operating_system_item.setText(device.operating_system)
+        identifier_item.setText(
+            device.udid if not table.isColumnHidden(2) else "Hidden"
+        )
+        status_item.setText(device.status)
         status_item.setForeground(QColor("#3fb950" if device.connected else "#fbbf24"))
-        table.setItem(row_index, 0, QTableWidgetItem(device.name))
-        table.setItem(row_index, 1, QTableWidgetItem(device.operating_system))
-        table.setItem(row_index, 2, QTableWidgetItem(device.udid))
+        table.setItem(row_index, 0, name_item)
+        table.setItem(row_index, 1, operating_system_item)
+        table.setItem(row_index, 2, identifier_item)
         table.setItem(row_index, 3, status_item)
-    table.setSortingEnabled(True)
+    if 0 <= current_row < len(devices):
+        table.selectRow(current_row)
 
 
 def create_ranked_table(headers: tuple[str, str, str]) -> QTableWidget:
@@ -1734,6 +2162,13 @@ def present_main_window(window: RviSentinelWindow) -> None:
 
 
 def main(arguments: list[str]) -> int:
+    instance_lock: QLockFile | None = None
+    if "--smoke-test" not in arguments:
+        try:
+            instance_lock = acquire_gui_instance_lock(GUI_INSTANCE_LOCK)
+        except GuiInstanceAlreadyRunningError as error:
+            print(str(error), file=sys.stderr)
+            return 0
     qt_arguments = [argument for argument in arguments if argument != "--smoke-test"]
     application = QApplication(qt_arguments)
     application.setApplicationName("RVI-Sentinel")
@@ -1751,7 +2186,10 @@ def main(arguments: list[str]) -> int:
 
     if "--smoke-test" in arguments:
         QTimer.singleShot(250, application.quit)
-    return application.exec()
+    exit_code = application.exec()
+    if instance_lock is not None:
+        instance_lock.unlock()
+    return exit_code
 
 
 if __name__ == "__main__":

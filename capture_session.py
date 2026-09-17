@@ -24,6 +24,7 @@ from capture_models import (
     CAPTURE_PREFLIGHT_EVENT,
     CAPTURE_STARTED_EVENT,
     CAPTURE_VALIDATED_EVENT,
+    CAPTURE_NO_TRAFFIC_EVENT,
     CaptureRequest,
     DeviceInfo,
     validate_capture_request,
@@ -33,6 +34,11 @@ ROOT = Path(__file__).resolve().parent
 UPSTREAM_CAPTURE = ROOT / "tools" / "rvi_capture" / "rvi_capture.py"
 RVI_INTERFACE = re.compile(r"^rvi[0-9]+$")
 APPLE_RVICTL = Path("/Library/Apple/usr/bin/rvictl")
+APPLE_RPMUXD_SERVICE = "system/com.apple.rpmuxd"
+APPLE_RPMUXD_PLISTS = (
+    Path("/Library/Apple/System/Library/LaunchDaemons/com.apple.rpmuxd.plist"),
+    Path("/System/Library/LaunchDaemons/com.apple.rpmuxd.plist"),
+)
 
 
 class CaptureSessionError(RuntimeError):
@@ -103,6 +109,29 @@ class CaptureProcessController:
                     ) from error
         finally:
             self.active_process = None
+
+
+def ensure_macos_rvi_relay_ready(launchctl: str) -> None:
+    result = subprocess.run(
+        [launchctl, "print", APPLE_RPMUXD_SERVICE],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+    installed_plist = next((path for path in APPLE_RPMUXD_PLISTS if path.is_file()), None)
+    if installed_plist is None:
+        raise CaptureSessionError(
+            "Apple RVI support is incomplete: the com.apple.rpmuxd launch daemon is not "
+            "installed. Open Xcode and install its requested device-support components, then "
+            "run Check setup again."
+        )
+    raise CaptureSessionError(
+        "Apple RVI support is installed, but com.apple.rpmuxd is not loaded. This causes "
+        "rvictl to fail with bootstrap error 1102. Open Check setup for the exact repair "
+        "command, then retry the capture."
+    )
 
 
 def stop_capture_process(process: subprocess.Popen[str]) -> None:
@@ -296,7 +325,7 @@ def native_authorized_tcpdump_command(
         "capture_pid=''; "
         "cleanup_capture() { "
         "if [ -n \"$capture_pid\" ] && /bin/kill -0 \"$capture_pid\" 2>/dev/null; then "
-        "/bin/kill -TERM \"$capture_pid\"; "
+        "/bin/kill -INT \"$capture_pid\"; "
         "if ! wait \"$capture_pid\" 2>/dev/null; then cleanup_wait_failed=1; fi; fi; "
         f"/bin/rm -f {preflight} {authorization} {ready} {cancellation}; "
         "}; "
@@ -309,12 +338,12 @@ def native_authorized_tcpdump_command(
         "/bin/sleep 1; "
         "done; "
         f"if [ -e {cancellation} ]; then "
-        "/bin/kill -TERM \"$capture_pid\"; "
+        "/bin/kill -INT \"$capture_pid\"; "
         "cancel_status=0; wait \"$capture_pid\" || cancel_status=$?; "
         "capture_pid=''; exit 44; "
         "fi; "
         "if /bin/kill -0 \"$capture_pid\" 2>/dev/null; then "
-        "/bin/kill -TERM \"$capture_pid\"; "
+        "/bin/kill -INT \"$capture_pid\"; "
         "preflight_status=0; wait \"$capture_pid\" || preflight_status=$?; "
         "capture_pid=''; "
         f"/usr/bin/printf '%s\\n' {no_packet_message} > {failure}; "
@@ -340,14 +369,20 @@ def native_authorized_tcpdump_command(
         "exit \"$capture_status\"; "
         "fi; "
         f"/usr/bin/touch {ready}; "
-        "capture_elapsed=0; "
-        f"while [ \"$capture_elapsed\" -lt {duration_seconds} ] && [ ! -e {cancellation} ]; do "
-        "/bin/sleep 1; capture_elapsed=$((capture_elapsed + 1)); "
+        "capture_started_at=$(/bin/date +%s); "
+        f"capture_deadline=$((capture_started_at + {duration_seconds})); "
+        f"while [ \"$(/bin/date +%s)\" -lt \"$capture_deadline\" ] && "
+        f"/bin/kill -0 \"$capture_pid\" 2>/dev/null && [ ! -e {cancellation} ]; do "
+        "/bin/sleep 1; "
         "done; "
-        "/bin/kill -TERM \"$capture_pid\"; "
+        f"if [ -e {cancellation} ]; then "
+        "if /bin/kill -0 \"$capture_pid\" 2>/dev/null; then /bin/kill -INT \"$capture_pid\"; fi; "
+        "cancel_status=0; wait \"$capture_pid\" || cancel_status=$?; "
+        "capture_pid=''; exit 44; "
+        "fi; "
+        "if /bin/kill -0 \"$capture_pid\" 2>/dev/null; then /bin/kill -INT \"$capture_pid\"; fi; "
         "capture_status=0; wait \"$capture_pid\" || capture_status=$?; "
         "capture_pid=''; "
-        f"if [ -e {cancellation} ]; then exit 44; fi; "
         "if [ \"$capture_status\" -ne 0 ]; then "
         f"/usr/bin/printf '%s\\n' {capture_failed_message} > {failure}; "
         "exit \"$capture_status\"; "
@@ -417,6 +452,40 @@ def ensure_macos_device_ready(udid: str) -> DeviceInfo:
     return device
 
 
+def remove_macos_rvi_interface(
+    rvictl: str,
+    ifconfig: str,
+    udid: str,
+    interface: str | None,
+    interfaces_before_capture: frozenset[str],
+) -> None:
+    stop = subprocess.run(
+        [rvictl, "-x", udid],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    interfaces_after_stop = available_rvi_interfaces(ifconfig)
+    created_interfaces = interfaces_after_stop - interfaces_before_capture
+    expected_interface_active = (
+        interface in interfaces_after_stop if interface is not None else False
+    )
+    if not expected_interface_active and not created_interfaces:
+        if stop.returncode != 0:
+            print(
+                "rvictl reported a cleanup error, but the capture RVI interface is no "
+                "longer present; cleanup was verified from the live interface list.",
+                flush=True,
+            )
+        return
+    detail = "\n".join(part for part in (stop.stdout, stop.stderr) if part).strip()
+    raise CaptureSessionError(
+        "Capture data was saved, but the RVI interface remained active after cleanup. "
+        f"rvictl exit: {stop.returncode}; remaining interfaces: "
+        f"{sorted(created_interfaces)}; diagnostic: {detail or 'none'}"
+    )
+
+
 def process_diagnostic(process: subprocess.Popen[str]) -> str:
     standard_output, standard_error = process.communicate()
     return "\n".join(
@@ -452,6 +521,8 @@ def run_authorized_macos_capture(
                 process.wait(timeout=10)
                 diagnostic = process_diagnostic(process)
                 detail = failure or diagnostic or "The authorized capture preflight failed."
+                if failure.startswith("No packets arrived"):
+                    print(CAPTURE_NO_TRAFFIC_EVENT, flush=True)
                 raise CaptureSessionError(detail)
             return_code = process.poll()
             if return_code is not None:
@@ -495,8 +566,8 @@ def run_authorized_macos_capture(
                 process.kill()
                 process.wait()
             raise CaptureSessionError(
-                "tcpdump did not close within 15 seconds after the requested duration. "
-                "RVI-Sentinel requested cleanup and stopped waiting."
+                "tcpdump did not close within the shutdown allowance after its requested "
+                "duration. RVI-Sentinel requested cleanup and stopped waiting."
             ) from error
         diagnostic = process_diagnostic(process)
         if diagnostic:
@@ -530,6 +601,7 @@ def run_macos_capture(
     tcpdump = shutil.which("tcpdump")
     ifconfig = shutil.which("ifconfig")
     osascript = shutil.which("osascript")
+    launchctl = shutil.which("launchctl")
     missing = [
         name
         for name, path in (
@@ -537,6 +609,7 @@ def run_macos_capture(
             ("tcpdump", tcpdump),
             ("ifconfig", ifconfig),
             ("osascript", osascript),
+            ("launchctl", launchctl),
         )
         if path is None
     ]
@@ -548,6 +621,9 @@ def run_macos_capture(
     tcpdump_path = cast(str, tcpdump)
     ifconfig_path = cast(str, ifconfig)
     osascript_path = cast(str, osascript)
+    launchctl_path = cast(str, launchctl)
+
+    ensure_macos_rvi_relay_ready(launchctl_path)
 
     print(
         f"Device ready: {ready_device.name} — {ready_device.status}",
@@ -562,12 +638,18 @@ def run_macos_capture(
         check=False,
     )
     start_output = "\n".join(part for part in (start.stdout, start.stderr) if part)
+    if "bootstrap_look_up(): 1102" in start_output or "[FAILED]" in start_output:
+        raise CaptureSessionError(
+            "Apple rvictl could not contact the com.apple.rpmuxd relay service. Open Check "
+            "setup for the exact repair command, then retry the capture."
+        )
     if start.returncode != 0:
         raise CaptureSessionError(
             f"rvictl could not start the selected device (exit {start.returncode}):\n"
             f"{start_output.strip()}"
         )
     capture_error: CaptureSessionError | None = None
+    interface: str | None = None
     try:
         interface = wait_for_created_rvi_interface(
             before,
@@ -622,7 +704,7 @@ def run_macos_capture(
                 ready_marker,
                 failure_marker,
                 300.0,
-                request.duration_seconds + 15.0,
+                request.duration_seconds + 45.0,
             )
             controller.cancellation_marker = None
         capture_size = validate_macos_capture_output(
@@ -637,18 +719,15 @@ def run_macos_capture(
         capture_error = error
     finally:
         controller.cancellation_marker = None
-        stop = subprocess.run(
-            [rvictl_path, "-x", request.device.udid],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if stop.returncode != 0:
-            detail = "\n".join(part for part in (stop.stdout, stop.stderr) if part).strip()
-            cleanup_error = CaptureSessionError(
-                f"Capture ended, but rvictl could not remove the device interface "
-                f"(exit {stop.returncode}): {detail}"
+        try:
+            remove_macos_rvi_interface(
+                rvictl_path,
+                ifconfig_path,
+                request.device.udid,
+                interface,
+                before,
             )
+        except CaptureSessionError as cleanup_error:
             if capture_error is not None:
                 raise CaptureSessionError(f"{capture_error}\n{cleanup_error}")
             raise cleanup_error

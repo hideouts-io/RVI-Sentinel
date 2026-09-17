@@ -196,7 +196,7 @@ The CLI analyzer uses Python's standard library. Packet decoding requires `tshar
 
 ## Desktop GUI
 
-The desktop GUI presents capture and analysis as two separate workspaces. It supports:
+The desktop GUI presents capture, analysis, and setup checks as separate workspaces. It supports:
 
 - recognizing physical iPhone/iPad devices and showing connected-versus-offline state;
 - selecting a connected device in a guided capture dialog;
@@ -204,14 +204,16 @@ The desktop GUI presents capture and analysis as two separate workspaces. It sup
 - choosing PCAPNG or PCAP and a local output path without overwriting existing evidence;
 - macOS readiness checks through Apple `devicectl`, followed by `rvictl`, a temporary RVI interface, and `tcpdump`;
 - Linux/Windows capture through the separately installed `gh2o/rvi_capture` backend;
-- live progress, activity output, cancellation, and platform-specific errors;
-- optional automatic handoff from a completed capture into analysis;
+- pass/fail setup checks for trust, USB access, capture backend, `tshark`, output-folder permissions, and disk space, with a specific fix for each failure;
+- live progress, cancellation, retryable no-traffic preflight, and platform-specific errors;
+- an unmistakable completion card with packet count, file size, actual packet-span duration, saved location, and next actions;
 
 - selecting or dropping an authorized PCAP, PCAPNG, or CAP file;
-- choosing a persistent baseline and export directory;
+- using a separate suggested baseline per device or imported investigation;
+- read-only analysis by default, followed by an explicit **Add findings to baseline** action;
 - configuring the DNS entropy threshold and console result count;
-- displaying the exact `analyze.py` command before execution;
-- live analyzer output and actionable process errors;
+- hiding device identifiers, exact commands, and raw process output under **Advanced details**;
+- copying redacted diagnostics that exclude device identifiers, packet data, and private paths;
 - summary, endpoint, DNS, TLS SNI, protocol, port, and entropy-heuristic views;
 - PTR reverse-DNS names and address-scope labels for every endpoint;
 - optional local MaxMind-compatible GeoIP city/country lookup without a web API;
@@ -237,9 +239,9 @@ Launch the GUI:
 
 On macOS, the launcher builds and ad-hoc signs a lightweight runtime app wrapper in the system temporary directory, outside a File Provider-managed Documents checkout. It starts with the project icon so RVI-Sentinel has its own Dock identity while all source, captures, baselines, and exports remain at their selected project paths. The generated wrapper stays outside version control and is recreated by `scripts/run_gui.sh`.
 
-The app opens on **Capture iPhone/iPad**. Connect the device by USB, unlock it, trust the host if prompted, and choose **Refresh Devices**. **New Capture…** opens a dialog for the device, duration, format, output path, and automatic-analysis choice. Offline devices are recognized but cannot be selected until connected.
+The app opens on **Capture iPhone/iPad**. Connect the device by USB, unlock it, trust the host if prompted, and choose **Refresh Devices**. **New Capture…** opens a dialog for the device, duration, format, and output path. Offline devices are recognized but cannot be selected until connected. The **Check setup** tab verifies the local prerequisites before capture. On ChromeOS, USB devices must be shared with Linux individually under **Settings > Developers > Linux > USB preferences**; see Google's [Linux on ChromeOS FAQ](https://developers.google.com/chromeos/app-development/develop/linux-on-chromeos-faq).
 
-On macOS, the timed capture requires a physical, booted, paired iPhone/iPad connected over USB. It then uses a narrow native administrator authorization prompt for `tcpdump`; RVI-Sentinel never asks for, reads, stores, or transmits the Mac password. The countdown stays stopped while authorization is pending and during a five-second live-packet preflight. Completed captures are closed, checked for the requested PCAP/PCAPNG header, and required to contain at least one readable packet before automatic analysis begins. The temporary RVI interface is removed after success, failure, or cancellation.
+On macOS, the timed capture requires a physical, booted, paired iPhone/iPad connected over USB. It then uses a narrow native administrator authorization prompt for `tcpdump`; RVI-Sentinel never asks for, reads, stores, or transmits the Mac password. The countdown stays stopped while authorization is pending and during a five-second live-packet preflight. If the connected phone is idle, open a webpage on it and choose **Retry Traffic Check** without re-entering the capture settings. Completed captures are closed, checked for the requested PCAP/PCAPNG header, and required to contain at least one readable packet. The completion card remains on the Capture tab so the user chooses what happens next. The temporary RVI interface is removed after success, failure, or cancellation.
 
 On Linux and Windows, choose **Install Capture Support** once to clone the canonical `gh2o/rvi_capture` source into the ignored local `tools/` directory. Linux still requires `libimobiledevice` and `usbmuxd`; Windows still requires iTunes or Apple Mobile Device Support and its running service.
 

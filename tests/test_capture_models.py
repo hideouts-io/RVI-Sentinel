@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,7 @@ from capture_models import (
     validate_capture_request,
 )
 from capture_session import (
+    CaptureProcessController,
     CaptureSessionError,
     native_authorized_tcpdump_command,
     parse_rvi_interfaces,
@@ -110,6 +113,15 @@ def main() -> None:
     assert core_devices[1].connected is False
     assert core_devices[1].status == "Not ready — not connected by USB"
 
+    modern_output = json.loads(DEVICECTL_OUTPUT)
+    modern_device = modern_output["result"]["devices"][0]
+    modern_device["deviceProperties"].pop("bootState")
+    modern_device["deviceProperties"]["bootedFromSnapshot"] = True
+    modern_device["connectionProperties"].pop("transportType")
+    modern_devices = parse_devicectl_devices(json.dumps(modern_output))
+    assert modern_devices[0].connected is False
+    assert "not connected by USB" in modern_devices[0].status
+
     round_trip = devices_from_json(devices_to_json(devices))
     assert round_trip == devices
 
@@ -166,6 +178,11 @@ def main() -> None:
         "1.en0 [Up, Running]\n17.rvi0 [Up, Running]\n"
     )
     assert tcpdump_interfaces == frozenset({"en0", "rvi0"})
+    controller = CaptureProcessController()
+    assert controller.run_for_duration(
+        [sys.executable, "-c", "raise SystemExit(0)"], 5, 0
+    ) == 0
+    assert controller.active_process is None
     command = native_authorized_tcpdump_command(
         "/usr/sbin/tcpdump",
         "rvi0",
@@ -180,12 +197,21 @@ def main() -> None:
         30,
     )
     assert "'/tmp/Authorized Capture.pcapng'" in command
-    assert '"$capture_elapsed" -lt 30' in command
+    assert "capture_deadline=$((capture_started_at + 30))" in command
+    assert '"$(/bin/date +%s)" -lt "$capture_deadline"' in command
+    assert "capture_elapsed" not in command
+    syntax_check = subprocess.run(
+        ["/bin/sh", "-n", "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert syntax_check.returncode == 0, syntax_check.stderr
     assert 'for preflight_second in 1 2 3 4 5' in command
     assert "-c 1" in command
     assert "-P -Z researcher" in command
-    assert "/bin/kill -TERM" in command
-    assert "/bin/kill -INT" not in command
+    assert "/bin/kill -INT" in command
+    assert "/bin/kill -TERM" not in command
     assert "administrator" not in command
 
     pcap_command = native_authorized_tcpdump_command(

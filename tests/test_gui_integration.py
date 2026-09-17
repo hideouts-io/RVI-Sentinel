@@ -20,7 +20,12 @@ from capture_models import (
     CaptureRequest,
     DeviceInfo,
 )
-from gui import RviSentinelWindow
+from gui import (
+    GuiInstanceAlreadyRunningError,
+    RviSentinelWindow,
+    acquire_gui_instance_lock,
+    populate_device_table,
+)
 from tests.test_analyzer import FAKE_TSHARK
 
 
@@ -43,12 +48,26 @@ def main() -> None:
         original_path = os.environ.get("PATH", "")
         os.environ["PATH"] = f"{binary_directory}:{original_path}"
         try:
+            instance_lock_path = temporary_root / "gui-instance.lock"
+            first_lock = acquire_gui_instance_lock(instance_lock_path)
+            try:
+                try:
+                    acquire_gui_instance_lock(instance_lock_path)
+                except GuiInstanceAlreadyRunningError:
+                    pass
+                else:
+                    raise AssertionError("A duplicate GUI instance acquired the same lock.")
+            finally:
+                first_lock.unlock()
             window = RviSentinelWindow()
             assert window.windowIcon().isNull() is False
-            assert window.workspace_tabs.count() == 2
+            assert window.workspace_tabs.count() == 3
             assert window.workspace_tabs.tabText(0) == "Capture iPhone/iPad"
             assert window.workspace_tabs.tabText(1) == "Analyze Capture"
+            assert window.workspace_tabs.tabText(2) == "Check setup"
             assert window.device_table.columnCount() == 4
+            assert window.device_table.isColumnHidden(2)
+            assert window.capture_console.isVisible() is False
             assert window.new_capture_button.objectName() == "newCaptureButton"
             logo = window.findChild(QLabel, "applicationLogo")
             assert logo is not None
@@ -66,6 +85,19 @@ def main() -> None:
                 capture_format="pcap",
                 analyze_after_capture=False,
             )
+            devices = (capture_request.device,)
+            window.discovered_devices = devices
+            populate_device_table(window.device_table, devices)
+            assert window.device_table.item(0, 2).text() == "Hidden"
+            name_item = window.device_table.item(0, 0)
+            name_item.setData(257, "preserved")
+            populate_device_table(window.device_table, devices)
+            assert window.device_table.item(0, 0) is name_item
+            assert window.device_table.item(0, 0).data(257) == "preserved"
+            window.set_advanced_details_visible(True)
+            assert window.device_table.item(0, 2).text() == capture_request.device.udid
+            window.set_advanced_details_visible(False)
+            assert window.device_table.item(0, 2).text() == "Hidden"
             window.active_capture_request = capture_request
             window.handle_capture_event(CAPTURE_AUTHORIZATION_EVENT)
             assert window.capture_timer.isActive() is False
@@ -155,7 +187,19 @@ def main() -> None:
             assert "NEW means newly observed" in window.interpretation.toPlainText()
             assert "Analysis complete." in window.status_label.text()
             assert (exports / "authorized_report.json").is_file()
-            assert baseline.is_file()
+            assert baseline.exists() is False, "Read-only analysis must not create a baseline"
+            assert window.add_to_baseline_button.isEnabled()
+
+            capture_request.output_path.write_bytes(b"synthetic completed capture\n")
+            window.active_capture_request = capture_request
+            window.capture_actual_seconds = 30.25
+            window.workspace_tabs.setCurrentIndex(0)
+            window.capture_finished(0, QProcess.ExitStatus.NormalExit)
+            assert window.workspace_tabs.currentIndex() == 0
+            assert window.completion_group.isHidden() is False
+            assert str(capture_request.output_path) in window.completion_summary.text()
+            assert "Actual capture time: 30.250 seconds" in window.completion_summary.text()
+            assert window.baseline_field.text() != str(baseline)
             window.close()
         finally:
             os.environ["PATH"] = original_path
@@ -163,12 +207,14 @@ def main() -> None:
     application.quit()
     print("PASS: headless GUI startup")
     print("PASS: application icon and visible logo")
-    print("PASS: separate guided capture and analysis workspaces")
+    print("PASS: duplicate GUI instance prevention")
+    print("PASS: separate guided capture, analysis, and setup workspaces")
     print("PASS: countdown begins only after authorization and live-packet preflight")
     print("PASS: GUI-to-analyzer process execution")
     print("PASS: generated report loading")
     print("PASS: summary and findings table population")
     print("PASS: explanatory port and endpoint presentation")
+    print("PASS: read-only analysis and visible capture completion card")
 
 
 if __name__ == "__main__":
