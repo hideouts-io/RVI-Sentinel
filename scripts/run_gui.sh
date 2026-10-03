@@ -17,7 +17,7 @@ fi
 if [[ "$(uname -s)" == "Darwin" ]]; then
   "$PROJECT_DIR/scripts/build_macos_app.sh"
   if [[ "${1:-}" == "--smoke-test" ]]; then
-    /usr/bin/open -n -W "$MACOS_APP" --args --project-dir "$PROJECT_DIR" "$@"
+    "$MACOS_APP/Contents/MacOS/RVI-Sentinel" --project-dir "$PROJECT_DIR" "$@"
     exit 0
   fi
   /usr/bin/open -n "$MACOS_APP" --args --project-dir "$PROJECT_DIR" "$@"

@@ -21,16 +21,19 @@ from capture_models import (
     DeviceInfo,
 )
 from gui import (
+    APP_ICON,
     GuiInstanceAlreadyRunningError,
     RviSentinelWindow,
     acquire_gui_instance_lock,
     populate_device_table,
 )
+from macos_application import set_macos_application_icon
 from tests.test_analyzer import FAKE_TSHARK
 
 
 def main() -> None:
     application = QApplication(["test_gui_integration"])
+    set_macos_application_icon(APP_ICON)
 
     with tempfile.TemporaryDirectory(prefix="rvi-sentinel-gui-integration-") as temp_directory:
         temporary_root = Path(temp_directory)

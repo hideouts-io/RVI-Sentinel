@@ -3,7 +3,10 @@
 ### Cross-platform iPhone/iPad packet capture and persistent network-baseline analysis
 
 <p align="center">
-  <img src="assets/rvi-sentinel-logo.png" width="220" alt="RVI-Sentinel iOS packet-capture logo">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding-v2/github/readme-logo-on-dark.png">
+    <img src="assets/branding-v2/github/readme-logo-on-light.png" width="560" alt="RVI-Sentinel route monogram and wordmark">
+  </picture>
 </p>
 
 ![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-000000?logo=apple&logoColor=white)

@@ -85,6 +85,7 @@ from finding_enrichment import (
     describe_port,
     parse_enrichment_output,
 )
+from macos_application import set_macos_application_icon
 
 ROOT = Path(__file__).resolve().parent
 ANALYZER = ROOT / "analyze.py"
@@ -97,7 +98,7 @@ CAPTURE_SESSION = ROOT / "capture_session.py"
 CAPTURE_SUPPORT_SETUP = ROOT / "scripts" / "setup_rvi_capture.py"
 DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
 DEFAULT_CAPTURE_DIRECTORY = ROOT / "captures"
-APP_ICON = ROOT / "assets" / "rvi-sentinel-logo.png"
+APP_ICON = ROOT / "assets" / "rvi-sentinel-app-icon.png"
 GUI_INSTANCE_LOCK = Path(tempfile.gettempdir()) / "rvi-sentinel-gui.lock"
 
 
@@ -468,7 +469,7 @@ class RviSentinelWindow(QMainWindow):
 
         logo = QLabel()
         logo.setObjectName("applicationLogo")
-        logo.setAccessibleName("RVI-Sentinel iOS packet-capture logo")
+        logo.setAccessibleName("RVI-Sentinel route application icon")
         logo.setPixmap(self.windowIcon().pixmap(58, 58))
         logo.setFixedSize(58, 58)
 
@@ -2175,6 +2176,7 @@ def main(arguments: list[str]) -> int:
     application.setApplicationDisplayName("RVI-Sentinel")
     application.setOrganizationName("hideouts-io")
     application.setWindowIcon(load_application_icon(APP_ICON))
+    set_macos_application_icon(APP_ICON)
 
     window = RviSentinelWindow()
     capture_path = initial_capture_path(arguments)
