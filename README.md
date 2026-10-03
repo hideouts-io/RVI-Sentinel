@@ -9,7 +9,7 @@
   </picture>
 </p>
 
-![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-000000?logo=apple&logoColor=white)
+![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20ChromeOS-000000?logo=apple&logoColor=white)
 ![Capture](https://img.shields.io/badge/capture-PCAP%20%7C%20PCAPNG-0969da)
 ![Analysis](https://img.shields.io/badge/analysis-tshark%20%2B%20persistent%20baseline-8250df)
 ![Test](https://img.shields.io/badge/analyzer-test%20passing-1a7f37)
@@ -30,6 +30,7 @@
 - [Analyze an Existing Capture](#analyze-an-existing-capture)
 - [macOS Capture with Apple RVI](#macos-capture-with-apple-rvi)
 - [Linux and Windows Capture](#linux-and-windows-capture)
+  - [ChromeOS (Chromebook) Capture](#chromeos-chromebook-prerequisites)
 - [Persistent Baselining](#persistent-baselining)
 - [Current Analysis Fields](#current-analysis-fields)
 - [Encryption Limitations](#encryption-limitations)
@@ -60,6 +61,7 @@ The analyzer works with ordinary `.pcap` and `.pcapng` files from any authorized
 
 - macOS iPhone/iPad capture with Apple `rvictl` + `rvi0` + `tcpdump`.
 - Linux and Windows iPhone/iPad capture through [`gh2o/rvi_capture`](https://github.com/gh2o/rvi_capture).
+- ChromeOS (Chromebook) capture through the built-in Linux development environment, using the Linux workflow.
 - PCAP and PCAPNG analysis through `tshark`.
 - IPv4 and IPv6 endpoint inventory.
 - TCP and UDP port-frequency analysis.
@@ -246,7 +248,7 @@ The app opens on **Capture iPhone/iPad**. Connect the device by USB, unlock it, 
 
 On macOS, the timed capture requires a physical, booted, paired iPhone/iPad connected over USB. It then uses a narrow native administrator authorization prompt for `tcpdump`; RVI-Sentinel never asks for, reads, stores, or transmits the Mac password. The countdown stays stopped while authorization is pending and during a five-second live-packet preflight. If the connected phone is idle, open a webpage on it and choose **Retry Traffic Check** without re-entering the capture settings. Completed captures are closed, checked for the requested PCAP/PCAPNG header, and required to contain at least one readable packet. The completion card remains on the Capture tab so the user chooses what happens next. The temporary RVI interface is removed after success, failure, or cancellation.
 
-On Linux and Windows, choose **Install Capture Support** once to clone the canonical `gh2o/rvi_capture` source into the ignored local `tools/` directory. Linux still requires `libimobiledevice` and `usbmuxd`; Windows still requires iTunes or Apple Mobile Device Support and its running service.
+On Linux (including the ChromeOS Linux development environment) and Windows, choose **Install Capture Support** once to clone the canonical `gh2o/rvi_capture` source into the ignored local `tools/` directory. Linux still requires `libimobiledevice` and `usbmuxd`; Windows still requires iTunes or Apple Mobile Device Support and its running service.
 
 Optionally open an existing capture immediately:
 
@@ -508,6 +510,65 @@ python capture_mobile.py `
 
 ---
 
+## ChromeOS (Chromebook) prerequisites
+
+On a Chromebook, RVI-Sentinel runs inside ChromeOS's built-in **Linux development environment**, a Debian container. Capture uses the same `gh2o/rvi_capture` backend and the same commands as [Linux](#linux-prerequisites); the ChromeOS-specific parts are enabling Linux and sharing the iPhone or iPad with it over USB.
+
+> [!NOTE]
+> Managed (school or work) Chromebooks may have Linux or USB sharing turned off by the administrator. If you can't enable either setting below, capture isn't available on that device. You can still analyze existing `.pcap`/`.pcapng` files on any host.
+
+### 1. Turn on the Linux development environment
+
+Open **Settings → About ChromeOS → Developers → Linux development environment**, choose **Set up**, and follow the prompts. When it finishes, a **Terminal** app opens with a Linux shell.
+
+### 2. Share the iPhone or iPad with Linux
+
+ChromeOS doesn't pass USB devices to Linux automatically:
+
+1. Connect the device with a data-capable cable, unlock it, and keep it unlocked.
+2. When ChromeOS shows a notification for the device, choose **Connect to Linux**. Or open **Settings → About ChromeOS → Developers → Linux development environment → Manage USB devices** and turn the device on.
+3. Tap **Trust** on the device if it asks.
+
+Reconnect or re-share the device after unplugging it or restarting Linux.
+
+### 3. Install the prerequisites in the Linux terminal
+
+The container is Debian-based, so the [Linux prerequisites](#linux-prerequisites) apply unchanged:
+
+```bash
+sudo apt update
+sudo apt install python3 libimobiledevice-utils usbmuxd tshark git
+```
+
+Confirm the shared device is visible:
+
+```bash
+idevice_id -l
+```
+
+If nothing is listed, check that the device is still shared with Linux (step 2) and that `usbmuxd` is running:
+
+```bash
+sudo systemctl status usbmuxd
+```
+
+### 4. Capture
+
+Clone RVI-Sentinel inside the Linux environment, install the upstream backend, and capture exactly as on Linux:
+
+```bash
+git clone https://github.com/hideouts-io/RVI-Sentinel.git
+cd RVI-Sentinel
+python3 scripts/setup_rvi_capture.py
+python3 capture_mobile.py \
+  --analyze \
+  captures/iphone_chromeos.pcapng
+```
+
+Captures, baselines, and reports are written inside the Linux container. To open them from the ChromeOS **Files** app, look under **Linux files**.
+
+---
+
 ## Direct upstream usage
 
 After running the setup helper, you can invoke upstream `rvi_capture.py` directly.
@@ -580,6 +641,7 @@ This can help distinguish traffic paths when the capture includes the relevant m
 | macOS | Apple `rvictl` + `tcpdump` | PCAP/PCAPNG | Yes |
 | Linux | `gh2o/rvi_capture` + `libimobiledevice`/`usbmuxd` | PCAP/PCAPNG | Yes |
 | Windows | `gh2o/rvi_capture` + Apple mobile-device services | PCAP/PCAPNG | Yes |
+| ChromeOS | `gh2o/rvi_capture` + `libimobiledevice`/`usbmuxd` in the Linux development environment | PCAP/PCAPNG | Yes |
 | Any analysis host | Existing authorized PCAP/PCAPNG | PCAP/PCAPNG | Yes |
 
 ---
