@@ -20,7 +20,6 @@ jobs:
     timeout-minutes: 20
     env:
       QT_QPA_PLATFORM: offscreen
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -45,4 +44,6 @@ jobs:
       - name: Run offscreen GUI integration tests
         run: venv/bin/python -m tests.test_gui_integration
       - name: Compile and smoke-test the native launcher
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: ./scripts/run_gui.sh --smoke-test
