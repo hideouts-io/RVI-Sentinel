@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python and native smoke
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-gui.txt
+      - name: Install the pinned GUI dependencies
+        run: |
+          python -m venv venv
+          venv/bin/python -m pip install --disable-pip-version-check -r requirements-gui.txt
+      - name: Validate Python modules
+        run: venv/bin/python -m py_compile analyze.py capture_models.py capture_devices.py capture_session.py capture_mobile.py gui.py gui_models.py enrich_endpoints.py finding_enrichment.py
+      - name: Run deterministic analyzer and model tests
+        run: |
+          venv/bin/python tests/test_analyzer.py
+          venv/bin/python -m tests.test_capture_models
+          venv/bin/python -m tests.test_gui_models
+          venv/bin/python -m tests.test_finding_enrichment
+      - name: Run offscreen GUI integration tests
+        run: venv/bin/python -m tests.test_gui_integration
+      - name: Compile and smoke-test the native launcher
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/run_gui.sh --smoke-test
