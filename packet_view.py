@@ -10,8 +10,9 @@ from threading import Event
 from typing import Callable, Iterator
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractItemView, QComboBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QSplitter, QTableView, QVBoxLayout, QWidget,
 )
 
@@ -28,6 +29,7 @@ COLUMNS = (
     "Frame", "Time (UTC)", "Protocol", "Source", "Destination", "Process",
     "Effective process", "Interface", "Direction", "Wire / captured bytes", "Stream",
 )
+COLUMN_WIDTHS: tuple[int, ...] = (64, 248, 156, 184, 184, 176, 176, 136, 112, 144, 96)
 CELL_MAX_BYTES = 8 * 1024
 INSPECTOR_MAX_BYTES = 512 * 1024
 INSPECTOR_LIMIT_NOTICE = "Inspector rendering limit exceeded."
@@ -36,6 +38,24 @@ INSPECTOR_LIMIT_NOTICE = "Inspector rendering limit exceeded."
 def evidence_tooltip_text(value: str) -> str:
     """Escape recorded text for Qt's rich-text tooltip renderer."""
     return '<pre style="white-space: pre-wrap">' + escape(value) + "</pre>"
+
+
+def configure_evidence_table(table: QTableView, column_widths: tuple[int, ...]) -> None:
+    """Keep bounded evidence columns resizable without measuring recorded payload text."""
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    table.setMinimumWidth(224)
+    table.verticalHeader().hide()
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    for column, width in enumerate(column_widths):
+        table.setColumnWidth(column, width)
+
+
+def configure_evidence_inspector(inspector: QPlainTextEdit) -> None:
+    """Use the platform's fixed-width font while retaining literal read-only evidence."""
+    inspector.setReadOnly(True)
+    inspector.setMinimumWidth(224)
+    inspector.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
 
 
 def validate_scope_frames(frame_numbers: tuple[int, ...], packet_count: int) -> None:
@@ -178,6 +198,18 @@ def packet_inspector_lines(report: AnalysisReport, packet: PacketRecord) -> Iter
     yield from ("", "Fields beginning pcapng.apple.process are read directly from the original container; frame and pktap fields are TShark observations.", "Only saved decoded fields are shown. Raw packet bytes are not present in this report. PTR resolution is not performed by the timeline.")
 
 
+def packet_inspector_refusal_text(report: AnalysisReport, packet: PacketRecord) -> str:
+    """Refuse the whole record while preserving its exact source identity and report reference."""
+    digest = report.evidence.sha256 if report.evidence is not None else "unavailable"
+    return "\n".join((
+        INSPECTOR_LIMIT_NOTICE, f"Capture SHA-256: {digest}",
+        f"Packet identity: sha256:{digest} / frame:{packet.frame_number}",
+        f"Exact recorded epoch: {packet.timestamp.epoch}",
+        "The complete inspector text exceeds the 512 KiB rendering ceiling. No partial record is presented.",
+        "All original decoded fields remain unchanged in the saved analysis report. Inspect that report for the complete evidence.",
+    ))
+
+
 def packet_inspector_text(report: AnalysisReport, packet: PacketRecord) -> str:
     """Render all evidence or explicitly refuse text exceeding 512 KiB; never truncate."""
     lines: list[str] = []
@@ -185,14 +217,7 @@ def packet_inspector_text(report: AnalysisReport, packet: PacketRecord) -> str:
     for line in packet_inspector_lines(report, packet):
         size += len(line.encode("utf-8")) + 1
         if size > INSPECTOR_MAX_BYTES:
-            digest = report.evidence.sha256 if report.evidence is not None else "unavailable"
-            return "\n".join((
-                INSPECTOR_LIMIT_NOTICE, f"Capture SHA-256: {digest}",
-                f"Packet identity: sha256:{digest} / frame:{packet.frame_number}",
-                f"Exact recorded epoch: {packet.timestamp.epoch}",
-                "The complete inspector text exceeds the 512 KiB rendering ceiling. No partial record is presented.",
-                "All original decoded fields remain unchanged in the saved analysis report. Inspect that report for the complete evidence.",
-            ))
+            return packet_inspector_refusal_text(report, packet)
         lines.append(line)
     return "\n".join(lines)
 
@@ -334,7 +359,10 @@ class PacketTimelineWidget(QWidget):
 
     def _create_controls(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
         filters = QGridLayout()
+        filters.setSpacing(4)
         self.search_field = self._text_control("packetSearch", "Literal text across saved decoded fields")
         self.endpoint_field = self._text_control("packetEndpointFilter", "Exact source or destination IP address")
         self.port_field = self._text_control("packetPortFilter", "Either source or destination port")
@@ -379,8 +407,9 @@ class PacketTimelineWidget(QWidget):
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-        splitter = QSplitter(Qt.Orientation.Vertical, self)
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setObjectName("packetTimelineSplitter")
+        splitter.setChildrenCollapsible(False)
         self.table = QTableView(splitter)
         self.table.setObjectName("packetTable")
         self.model = PacketPageModel(self.table)
@@ -390,9 +419,13 @@ class PacketTimelineWidget(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(False)
         self.table.setWordWrap(False)
+        configure_evidence_table(self.table, COLUMN_WIDTHS)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         inspector_panel = QWidget(splitter)
+        inspector_panel.setObjectName("packetInspectorPanel")
         inspector_layout = QVBoxLayout(inspector_panel)
+        inspector_layout.setContentsMargins(6, 6, 6, 6)
+        inspector_layout.setSpacing(4)
         self.selection_notice = QLabel(inspector_panel)
         self.selection_notice.setObjectName("packetSelectionNotice")
         self.selection_notice.setTextFormat(Qt.TextFormat.PlainText)
@@ -401,20 +434,16 @@ class PacketTimelineWidget(QWidget):
         self.correlation_label.setObjectName("packetSessionCorrelation")
         self.correlation_label.setTextFormat(Qt.TextFormat.PlainText)
         self.correlation_label.setWordWrap(True)
+        self.correlation_label.hide()
         self.inspector = QPlainTextEdit(inspector_panel)
         self.inspector.setObjectName("packetInspector")
-        self.inspector.setReadOnly(True)
+        configure_evidence_inspector(self.inspector)
         inspector_layout.addWidget(self.selection_notice)
         inspector_layout.addWidget(self.correlation_label)
-        inspector_layout.addWidget(self.inspector)
-        splitter.addWidget(self.table)
-        splitter.addWidget(inspector_panel)
-        layout.addWidget(splitter, 1)
-        navigation = QHBoxLayout()
-        self.previous_button = self._button("packetPreviousPage", "Previous page", self.previous_page)
-        self.next_button = self._button("packetNextPage", "Next page", self.next_page)
-        navigation.addWidget(self.previous_button)
-        navigation.addWidget(self.next_button)
+        inspector_layout.addWidget(self.inspector, 1)
+        context_actions = QGridLayout()
+        context_actions.setContentsMargins(0, 0, 0, 0)
+        context_actions.setSpacing(4)
         self.owning_session_button = self._button("packetShowOwningSession", "Show owning session", self.owning_session_requested.emit)
         self.back_to_sessions_button = self._button("packetBackToSessions", "Back to sessions", self.back_to_sessions_requested.emit)
         self.restore_timeline_button = self._button("packetRestoreTimeline", "Restore previous packet view", self.restore_timeline_requested.emit)
@@ -423,10 +452,20 @@ class PacketTimelineWidget(QWidget):
         self.owning_session_button.setEnabled(False)
         self.back_to_sessions_button.setEnabled(False)
         self.restore_timeline_button.setEnabled(False)
-        navigation.addWidget(self.owning_session_button)
-        navigation.addWidget(self.back_to_sessions_button)
-        navigation.addWidget(self.restore_timeline_button)
-        navigation.addWidget(self.return_dns_button)
+        for position, button in enumerate((self.owning_session_button, self.back_to_sessions_button,
+                                           self.restore_timeline_button, self.return_dns_button)):
+            context_actions.addWidget(button, position // 2, position % 2)
+        inspector_layout.addLayout(context_actions)
+        splitter.addWidget(self.table)
+        splitter.addWidget(inspector_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+        navigation = QHBoxLayout()
+        self.previous_button = self._button("packetPreviousPage", "Previous page", self.previous_page)
+        self.next_button = self._button("packetNextPage", "Next page", self.next_page)
+        navigation.addWidget(self.previous_button)
+        navigation.addWidget(self.next_button)
         navigation.addStretch()
         layout.addLayout(navigation)
         self.page_size.currentIndexChanged.connect(self.apply_filters)
@@ -711,6 +750,7 @@ class PacketTimelineWidget(QWidget):
         self.packet_selected.emit(self.selected_identity)
 
     def set_correlation_context(self, message: str) -> None:
+        """Show complete bounded context, refusing the whole record when combined rendering exceeds its ceiling."""
         if len(message.encode("utf-8")) > 4096 or any(ord(character) < 32 for character in message):
             raise PacketQueryValidationError("Session correlation context must be bounded plain text.")
         self.correlation_label.setText(message)
@@ -719,8 +759,9 @@ class PacketTimelineWidget(QWidget):
             if packet is not None:
                 text = packet_inspector_text(self.report, packet)
                 combined = text + "\n\nSession correlation\n" + message
-                if not text.startswith(INSPECTOR_LIMIT_NOTICE) and len(combined.encode("utf-8")) <= INSPECTOR_MAX_BYTES:
-                    self.inspector.setPlainText(combined)
+                if len(combined.encode("utf-8")) > INSPECTOR_MAX_BYTES:
+                    combined = packet_inspector_refusal_text(self.report, packet) + "\n\nSession correlation\n" + message
+                self.inspector.setPlainText(combined)
 
     def capture_navigation(self) -> PacketNavigation | None:
         report = self.report

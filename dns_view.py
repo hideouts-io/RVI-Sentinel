@@ -28,13 +28,17 @@ from dns_sessions import (
 from packet_models import ProcessMetadata
 from packet_sessions import SessionIdentity, SessionValidationError, session_for_identity
 from packet_timeline import PacketIdentity, packet_for_identity
-from packet_view import INSPECTOR_MAX_BYTES, endpoint_label, dns_message_lines, evidence_tooltip_text
+from packet_view import (
+    INSPECTOR_MAX_BYTES, configure_evidence_inspector, configure_evidence_table,
+    endpoint_label, dns_message_lines, evidence_tooltip_text,
+)
 
 COLUMNS = (
     "Question name", "Answer address", "Query frame", "Response frame", "Message index",
     "TTL seconds", "Response exact epoch", "Effective expiry exact epoch", "Matched packets",
     "Process relation",
 )
+COLUMN_WIDTHS: tuple[int, ...] = (220, 168, 94, 102, 94, 94, 172, 188, 112, 128)
 
 
 def dns_association_cell(association: DnsSessionAssociation, column: int) -> str:
@@ -375,11 +379,14 @@ class DnsSessionWidget(QWidget):
         for size in (100, 250, 500):
             self.page_size.addItem(str(size), size)
         filters.addWidget(self.search_field, 1)
-        for button in (self.apply_button, self.clear_button, self.show_all_button, self.cancel_button):
-            filters.addWidget(button)
         filters.addWidget(QLabel("Rows per page", self))
         filters.addWidget(self.page_size)
         layout.addLayout(filters)
+        filter_actions = QHBoxLayout()
+        for button in (self.apply_button, self.clear_button, self.show_all_button, self.cancel_button):
+            filter_actions.addWidget(button)
+        filter_actions.addStretch()
+        layout.addLayout(filter_actions)
         self.status_label = QLabel(self)
         self.status_label.setObjectName("dnsPageStatus")
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -402,6 +409,7 @@ class DnsSessionWidget(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(False)
         self.table.setWordWrap(False)
+        configure_evidence_table(self.table, COLUMN_WIDTHS)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         panel = QWidget(splitter)
         panel_layout = QVBoxLayout(panel)
@@ -413,7 +421,7 @@ class DnsSessionWidget(QWidget):
         self.selection_notice.setWordWrap(True)
         self.inspector = QPlainTextEdit(panel)
         self.inspector.setObjectName("dnsEvidenceInspector")
-        self.inspector.setReadOnly(True)
+        configure_evidence_inspector(self.inspector)
         panel_layout.addWidget(self.selection_notice)
         panel_layout.addWidget(self.inspector)
         actions = QGridLayout()
@@ -440,8 +448,11 @@ class DnsSessionWidget(QWidget):
         for button in (self.previous_button, self.next_button, self.observed_button):
             navigation.addWidget(button)
         navigation.addStretch()
-        navigation.addWidget(self.return_session_button)
         layout.addLayout(navigation)
+        return_navigation = QHBoxLayout()
+        return_navigation.addStretch()
+        return_navigation.addWidget(self.return_session_button)
+        layout.addLayout(return_navigation)
         self.page_size.currentIndexChanged.connect(self.apply_filters)
         self.search_field.returnPressed.connect(self.apply_filters)
 

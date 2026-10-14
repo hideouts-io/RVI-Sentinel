@@ -19,7 +19,7 @@ import packet_view
 from gui_models import AnalysisEvidence, AnalysisReport, AnalysisSummary, CaptureDetails
 from packet_models import PacketRecord, decode_packet_fields, packet_document, validate_packet_document
 from packet_timeline import PacketIdentity, PacketIndex, PacketPage, PacketQuery, PacketQueryCancelled
-from packet_view import CELL_MAX_BYTES, INSPECTOR_MAX_BYTES, PacketTimelineWidget, packet_cell
+from packet_view import CELL_MAX_BYTES, INSPECTOR_MAX_BYTES, PacketTimelineWidget, packet_cell, packet_inspector_text
 
 
 def wait_until(condition: Callable[[], bool], timeout_milliseconds: int) -> None:
@@ -260,6 +260,62 @@ class PacketViewTests(unittest.TestCase):
         self.assertIn("128 recorded labels", cell)
         self.assertIn("8 KiB cell limit", cell)
         self.assertEqual(self.widget.report.packets[0].fields, record.fields)
+
+        prefix = "Ungrouped packet: missing_stream. Passive DNS <b>literal<script>.test & session evidence: "
+        context = prefix + "c" * (4096 - len(prefix) - len(" END OF CONTEXT")) + " END OF CONTEXT"
+        self.widget.set_correlation_context(context)
+        contextual_text = self.widget.inspector.toPlainText()
+        self.assertLess(len(contextual_text.encode("utf-8")), INSPECTOR_MAX_BYTES)
+        self.assertIn("Inspector rendering limit exceeded", contextual_text)
+        self.assertIn("Capture SHA-256: " + "a" * 64, contextual_text)
+        self.assertIn("frame:1", contextual_text)
+        self.assertIn("Exact recorded epoch: " + record.timestamp.epoch, contextual_text)
+        self.assertIn("No partial record is presented", contextual_text)
+        self.assertIn("Session correlation\n" + context, contextual_text)
+        self.assertNotIn(occurrences[-1], contextual_text)
+        self.assertEqual(self.widget.report.packets[0].fields, record.fields)
+
+    def test_complete_record_is_refused_when_correlation_pushes_inspector_over_limit(self) -> None:
+        values = {field.name: field.values for field in self.report.packets[0].fields}
+        occurrences = tuple(f"{position:03d}" + "x" * 1006 for position in range(128))
+        for name in ("dns.qry.name", "dns.resp.name", "dns.cname", "http.host"):
+            values[name] = occurrences
+        record = decode_packet_fields(values, tuple(values))
+        self.assertEqual(validate_packet_document(packet_document(record)), record)
+        evidence = self.report.evidence
+        if evidence is None:
+            raise AssertionError("The synthetic packet report must have capture-bound evidence.")
+        report = replace(self.report, packets=(record,), evidence=replace(evidence,
+            supported_fields=tuple(values), supported_field_count=len(values), packet_record_count=1))
+        raw_text = packet_inspector_text(report, record)
+        self.assertLess(len(raw_text.encode("utf-8")), INSPECTOR_MAX_BYTES)
+        self.assertNotIn("Inspector rendering limit exceeded", raw_text)
+        self.assertIn(occurrences[-1], raw_text)
+        self.widget.set_report(report)
+        self.ready()
+        self.widget.table.selectRow(0)
+        short_context = "Scoped TCP stream 0; passive DNS candidate remains uncertain."
+        self.widget.set_correlation_context(short_context)
+        self.assertEqual(self.widget.inspector.toPlainText(), raw_text + "\n\nSession correlation\n" + short_context)
+
+        prefix = "Scoped TCP stream 0; literal DNS <b>near-limit.test & candidate evidence: "
+        context = prefix + "c" * (2000 - len(prefix) - len(" END OF CONTEXT")) + " END OF CONTEXT"
+        self.assertGreater(len((raw_text + "\n\nSession correlation\n" + context).encode("utf-8")), INSPECTOR_MAX_BYTES)
+        self.widget.set_correlation_context(context)
+        text = self.widget.inspector.toPlainText()
+        self.assertLess(len(text.encode("utf-8")), INSPECTOR_MAX_BYTES)
+        self.assertIn("Inspector rendering limit exceeded", text)
+        self.assertIn("Capture SHA-256: " + "a" * 64, text)
+        self.assertIn("frame:1", text)
+        self.assertIn("Exact recorded epoch: " + record.timestamp.epoch, text)
+        self.assertIn("No partial record is presented", text)
+        self.assertIn("All original decoded fields remain unchanged", text)
+        self.assertIn("Session correlation\n" + context, text)
+        self.assertNotIn(occurrences[-1], text)
+        self.assertEqual(self.widget.report.packets[0].fields, record.fields)
+        self.widget.set_correlation_context(short_context)
+        self.assertEqual(self.widget.inspector.toPlainText(), raw_text + "\n\nSession correlation\n" + short_context)
+
     def test_selection_restores_matching_page_and_navigation_does_not_jump_back(self) -> None:
         self.load()
         self.click("packetNextPage")

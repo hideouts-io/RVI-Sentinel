@@ -12,12 +12,13 @@ import json
 import re
 import tempfile
 import uuid
+from functools import partial
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from PySide6.QtCore import QEvent, QLockFile, QObject, QProcess, QProcessEnvironment, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QLockFile, QObject, QProcess, QProcessEnvironment, Qt, QTimer, QUrl, QSignalBlocker, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -43,11 +44,13 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -56,6 +59,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui_shell import (
+    DESTINATIONS, Destination, destination_for_key, overview_page, plain_label,
+    populate_sidebar, scroll_page, shell_stylesheet,
+)
 from gui_models import (
     AnalysisReport,
     AnalysisRequest,
@@ -187,10 +194,7 @@ class CaptureSetupDialog(QDialog):
             "decrypt protected payloads."
         )
         explanation.setWordWrap(True)
-        explanation.setStyleSheet(
-            "background: #172554; border-left: 4px solid #3b82f6; "
-            "border-radius: 4px; padding: 10px; color: #bfdbfe;"
-        )
+        explanation.setProperty("role", "notice")
         layout.addWidget(explanation)
 
         form_group = QGroupBox("Capture settings")
@@ -240,7 +244,6 @@ class CaptureSetupDialog(QDialog):
 
         permission_note = QLabel(capture_permission_note(platform.system()))
         permission_note.setWordWrap(True)
-        permission_note.setStyleSheet("color: #9ca3af;")
         layout.addWidget(permission_note)
         layout.addWidget(self.buttons)
 
@@ -389,6 +392,10 @@ class RviSentinelWindow(QMainWindow):
         self.report_loading = False
         self.closing_requested = False
         self.quit_requested = False
+        self.navigation_sidebar = QListWidget()
+        self.detail_stack = QStackedWidget()
+        self.result_selector = QComboBox()
+        self.shortcut_pages: dict[Destination, QWidget] = {}
         self.workspace_tabs = QTabWidget()
         self.results_tabs = QTabWidget()
         self.packet_timeline = PacketTimelineWidget(self)
@@ -482,138 +489,200 @@ class RviSentinelWindow(QMainWindow):
         self.resize(1180, 820)
         self.setMinimumSize(900, 680)
         self.setAcceptDrops(True)
-        self.setStyleSheet(
-            """
-            QMainWindow { background: #0b1220; }
-            QDialog { background: #0b1220; }
-            QWidget { color: #e6edf3; font-size: 13px; }
-            QLabel#applicationTitle { font-size: 28px; font-weight: 700; }
-            QGroupBox {
-                border: 1px solid #30363d;
-                border-radius: 8px;
-                margin-top: 12px;
-                padding: 12px;
-                font-weight: 600;
-            }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
-                background: #111827;
-                border: 1px solid #374151;
-                border-radius: 6px;
-                padding: 6px;
-                selection-background-color: #2563eb;
-            }
-            QComboBox::drop-down { border: 0; width: 24px; }
-            QProgressBar {
-                background: #111827;
-                border: 1px solid #374151;
-                border-radius: 6px;
-                text-align: center;
-                min-height: 20px;
-            }
-            QProgressBar::chunk { background: #1f6feb; border-radius: 5px; }
-            QTableWidget, QTableView {
-                background: #111827;
-                alternate-background-color: #0f172a;
-                border: 1px solid #374151;
-                border-radius: 6px;
-                gridline-color: #374151;
-                selection-background-color: #1f6feb;
-                selection-color: #ffffff;
-            }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-                border: 1px solid #58a6ff;
-            }
-            QPushButton {
-                background: #1f6feb;
-                border: 0;
-                border-radius: 6px;
-                padding: 8px 14px;
-                font-weight: 600;
-            }
-            QPushButton:hover { background: #388bfd; }
-            QPushButton:disabled { background: #30363d; color: #8b949e; }
-            QTabWidget { background: #0b1220; }
-            QTabWidget::pane {
-                background: #111827;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-            }
-            QTabBar { background: #0b1220; }
-            QTabBar::tab { background: #161b22; padding: 8px 13px; margin-right: 2px; }
-            QTabBar::tab:selected { background: #1f6feb; }
-            QHeaderView::section {
-                background: #1f2937;
-                border: 0;
-                border-right: 1px solid #374151;
-                padding: 7px;
-                font-weight: 600;
-            }
-            """
-        )
+        self.setStyleSheet(shell_stylesheet())
 
     def build_interface(self) -> None:
+        """Keep evidence page instances while navigating a native desktop sidebar."""
         root_widget = QWidget()
-        root_layout = QVBoxLayout(root_widget)
-        root_layout.setContentsMargins(20, 18, 20, 18)
-        root_layout.setSpacing(12)
-
-        title = QLabel("RVI-Sentinel")
-        title.setObjectName("applicationTitle")
-        title_font = QFont()
-        title_font.setPointSize(24)
-        title_font.setBold(True)
-        title.setFont(title_font)
-
-        subtitle = QLabel(
-            "Guided iPhone/iPad capture and persistent PCAP/PCAPNG baseline analysis"
-        )
-        subtitle.setStyleSheet("color: #9ca3af; font-size: 14px;")
-
-        logo = QLabel()
+        root_layout = QHBoxLayout(root_widget)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        sidebar_panel = QWidget(root_widget)
+        sidebar_panel.setObjectName("sidebarPanel")
+        sidebar_layout = QVBoxLayout(sidebar_panel)
+        sidebar_layout.setContentsMargins(10, 18, 10, 12)
+        sidebar_layout.setSpacing(14)
+        branding = QHBoxLayout()
+        logo = QLabel(sidebar_panel)
         logo.setObjectName("applicationLogo")
         logo.setAccessibleName("RVI-Sentinel route application icon")
-        logo.setPixmap(self.windowIcon().pixmap(58, 58))
-        logo.setFixedSize(58, 58)
+        logo.setPixmap(self.windowIcon().pixmap(32, 32))
+        logo.setFixedSize(32, 32)
+        branding.addWidget(logo)
+        title = QLabel("RVI-Sentinel", sidebar_panel)
+        title.setObjectName("applicationTitle")
+        branding.addWidget(title)
+        sidebar_layout.addLayout(branding)
+        populate_sidebar(self.navigation_sidebar)
+        sidebar_layout.addWidget(self.navigation_sidebar, 1)
+        local_notice = plain_label("Python • local analysis", "localAnalysisNotice", sidebar_panel)
+        sidebar_layout.addWidget(local_notice)
+        root_layout.addWidget(sidebar_panel)
 
-        title_layout = QVBoxLayout()
-        title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(2)
-        title_layout.addWidget(title)
-        title_layout.addWidget(subtitle)
-
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(12)
-        header_layout.addWidget(logo)
-        header_layout.addLayout(title_layout)
-        header_layout.addStretch(1)
+        detail = QWidget(root_widget)
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(18, 12, 18, 12)
+        detail_layout.setSpacing(10)
+        heading = QVBoxLayout()
+        heading.setSpacing(2)
+        self.page_title = plain_label("Overview", "pageTitle", detail)
+        self.page_subtitle = plain_label("Local capture and evidence analysis", "pageSubtitle", detail)
+        heading.addWidget(self.page_title)
+        heading.addWidget(self.page_subtitle)
+        header = QHBoxLayout()
+        header.addLayout(heading, 1)
         self.advanced_toggle.setObjectName("advancedDetailsToggle")
         self.copy_diagnostics_button.setObjectName("copyDiagnosticsButton")
-        header_layout.addWidget(self.advanced_toggle)
-        header_layout.addWidget(self.copy_diagnostics_button)
+        header.addWidget(self.advanced_toggle)
+        detail_layout.addLayout(header)
+        self.detail_stack.setObjectName("workspaceStack")
+        overview, cards = overview_page(detail)
+        self.shortcut_pages["overview"] = overview
+        self.detail_stack.addWidget(overview)
+        for key, button in cards:
+            button.clicked.connect(partial(self.show_destination, key))
 
-        scope = QLabel(
-            "A new endpoint or hostname is a change to investigate, not proof of malicious activity. "
-            "Encrypted payloads remain protected."
-        )
-        scope.setWordWrap(True)
-        scope.setStyleSheet(
-            "background: #172554; border-left: 4px solid #3b82f6; "
-            "border-radius: 4px; padding: 10px; color: #bfdbfe;"
-        )
-
-        root_layout.addLayout(header_layout)
-        root_layout.addWidget(scope)
         self.workspace_tabs.setObjectName("workspaceTabs")
         self.workspace_tabs.setDocumentMode(True)
         self.workspace_tabs.addTab(self.create_capture_workspace(), "Capture iPhone/iPad")
         self.workspace_tabs.addTab(self.create_analysis_workspace(), "Analyze Capture")
         self.workspace_tabs.addTab(self.create_setup_workspace(), "Check setup")
-        self.workspace_tabs.setCurrentIndex(0)
-        root_layout.addWidget(self.workspace_tabs, 1)
-
+        self.workspace_tabs.tabBar().hide()
+        self.detail_stack.addWidget(self.workspace_tabs)
+        for key in ("baselines", "exports", "diagnostics"):
+            page = self.create_shortcut_page(key)
+            self.shortcut_pages[key] = page
+            self.detail_stack.addWidget(page)
+        detail_layout.addWidget(self.detail_stack, 1)
+        root_layout.addWidget(detail, 1)
         self.setCentralWidget(root_widget)
+        self.navigation_sidebar.currentRowChanged.connect(self.sidebar_destination_changed)
+        self.workspace_tabs.currentChanged.connect(self.workspace_destination_changed)
+        self.results_tabs.currentChanged.connect(self.sync_result_selection)
+        self.result_selector.currentIndexChanged.connect(self.select_result)
+        self.refresh_result_selector()
+        self.show_destination("overview")
+
+    def create_shortcut_page(self, key: Destination) -> QWidget:
+        """Expose current local choices and reuse explicit existing workflow actions."""
+        content = QWidget(self)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(2, 4, 2, 4)
+        layout.setSpacing(14)
+        if key == "baselines":
+            description = "Choose the history for this investigation. Preview analysis leaves it unchanged. Apply reviewed findings using Update baseline in Analysis."
+            self.baseline_path_label = plain_label(self.baseline_field.text() or "No baseline selected", "baselinePath", content)
+            self.baseline_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            choose = QPushButton("Choose baseline…", content)
+            choose.setObjectName("baselineShortcutBrowseButton")
+            choose.clicked.connect(self.choose_baseline)
+            review = QPushButton("Review findings in Analysis", content)
+            review.setObjectName("baselineReviewButton")
+            review.clicked.connect(partial(self.show_destination, "analysis"))
+            layout.addWidget(plain_label(description, "baselineExplanation", content))
+            layout.addWidget(self.baseline_path_label)
+            actions = QHBoxLayout()
+            actions.addWidget(choose)
+            actions.addWidget(review)
+            actions.addStretch(1)
+            layout.addLayout(actions)
+            self.baseline_field.textChanged.connect(self.refresh_shortcut_paths)
+        elif key == "exports":
+            description = "Analysis writes JSON reports and CSV summaries to the selected local directory. Inspect packets, sessions, and DNS evidence in Analysis."
+            self.export_path_label = plain_label(self.export_field.text(), "exportPath", content)
+            self.export_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            choose = QPushButton("Choose directory…", content)
+            choose.setObjectName("exportShortcutBrowseButton")
+            choose.clicked.connect(self.choose_export_directory)
+            self.export_shortcut_open = QPushButton("Open local exports", content)
+            self.export_shortcut_open.setObjectName("exportShortcutOpenButton")
+            self.export_shortcut_open.clicked.connect(self.open_exports_button.click)
+            layout.addWidget(plain_label(description, "exportExplanation", content))
+            layout.addWidget(self.export_path_label)
+            actions = QHBoxLayout()
+            actions.addWidget(choose)
+            actions.addWidget(self.export_shortcut_open)
+            actions.addStretch(1)
+            layout.addLayout(actions)
+            self.export_field.textChanged.connect(self.refresh_shortcut_paths)
+        elif key == "diagnostics":
+            layout.addWidget(plain_label(
+                "Copy local setup and recording status for troubleshooting. The copied text excludes device identifiers, private paths, and packet contents.",
+                "diagnosticsExplanation", content,
+            ))
+            self.diagnostics_status = plain_label("", "diagnosticsStatus", content)
+            self.diagnostics_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            layout.addWidget(self.diagnostics_status)
+            self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
+            layout.addWidget(self.copy_diagnostics_button, 0, Qt.AlignmentFlag.AlignLeft)
+            setup = QPushButton("Review setup checks", content)
+            setup.setObjectName("diagnosticsSetupButton")
+            setup.clicked.connect(partial(self.show_destination, "setup"))
+            layout.addWidget(setup, 0, Qt.AlignmentFlag.AlignLeft)
+        else:
+            raise ValueError(f"Destination has no shortcut page: {key}")
+        layout.addStretch(1)
+        return scroll_page(content, key + "Page", self)
+
+    @Slot()
+    def refresh_shortcut_paths(self) -> None:
+        self.baseline_path_label.setText(self.baseline_field.text() or "No baseline selected")
+        self.export_path_label.setText(self.export_field.text() or "No export directory selected")
+        self.export_shortcut_open.setEnabled(self.open_exports_button.isEnabled())
+
+    def show_destination(self, key: Destination) -> None:
+        """Navigate only; analysis, capture, enrichment and persistence stay explicit."""
+        destination = destination_for_key(key)
+        with QSignalBlocker(self.navigation_sidebar):
+            self.navigation_sidebar.setCurrentRow(DESTINATIONS.index(destination))
+        if destination.workspace_index is not None:
+            with QSignalBlocker(self.workspace_tabs):
+                self.workspace_tabs.setCurrentIndex(destination.workspace_index)
+            self.detail_stack.setCurrentWidget(self.workspace_tabs)
+        else:
+            self.detail_stack.setCurrentWidget(self.shortcut_pages[key])
+        self.page_title.setText(destination.title)
+        self.page_subtitle.setText(destination.subtitle)
+        self.refresh_shortcut_paths()
+        if key == "diagnostics":
+            receipt = self.capture_receipt if self.capture_receipt_error is None else None
+            self.diagnostics_status.setText(
+                f"Capture host: {platform.system()}\nSetup: {self.check_status.text()}\n"
+                f"Recording outcome: {receipt.capture_outcome if receipt is not None else 'unverified'}\n"
+                f"Artifact validation: {receipt.validation_status if receipt is not None else 'unverified'}"
+            )
+
+    @Slot(int)
+    def sidebar_destination_changed(self, row: int) -> None:
+        if 0 <= row < len(DESTINATIONS):
+            self.show_destination(DESTINATIONS[row].key)
+
+    @Slot(int)
+    def workspace_destination_changed(self, index: int) -> None:
+        for destination in DESTINATIONS:
+            if destination.workspace_index == index:
+                self.show_destination(destination.key)
+                return
+
+    def refresh_result_selector(self) -> None:
+        """Store original page indexes, including advanced-only Console visibility."""
+        with QSignalBlocker(self.result_selector):
+            self.result_selector.clear()
+            for index in range(self.results_tabs.count()):
+                if self.results_tabs.isTabVisible(index):
+                    self.result_selector.addItem(self.results_tabs.tabText(index), index)
+            self.result_selector.setCurrentIndex(self.result_selector.findData(self.results_tabs.currentIndex()))
+
+    @Slot(int)
+    def sync_result_selection(self, index: int) -> None:
+        with QSignalBlocker(self.result_selector):
+            self.result_selector.setCurrentIndex(self.result_selector.findData(index))
+
+    @Slot(int)
+    def select_result(self, row: int) -> None:
+        index: object = self.result_selector.itemData(row)
+        if type(index) is int and 0 <= index < self.results_tabs.count() and self.results_tabs.isTabVisible(index):
+            self.results_tabs.setCurrentIndex(index)
 
     def create_capture_workspace(self) -> QWidget:
         page = QWidget()
@@ -626,7 +695,6 @@ class RviSentinelWindow(QMainWindow):
             "3. Choose New Capture to select the device, duration, format, and local output file."
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet("font-size: 14px; color: #cbd5e1;")
         layout.addWidget(intro)
 
         device_group = QGroupBox("Connected Apple mobile devices")
@@ -635,7 +703,6 @@ class RviSentinelWindow(QMainWindow):
             f"Capture host: {platform.system()} • {capture_backend_summary(platform.system())}"
         )
         host_label.setObjectName("captureBackendLabel")
-        host_label.setStyleSheet("color: #9ca3af;")
         device_layout.addWidget(host_label)
         device_layout.addWidget(self.device_table, 1)
 
@@ -700,10 +767,7 @@ class RviSentinelWindow(QMainWindow):
             "to inspect. RVI-Sentinel does not upload captures or device identifiers."
         )
         privacy.setWordWrap(True)
-        privacy.setStyleSheet(
-            "background: #052e16; border-left: 4px solid #22c55e; "
-            "border-radius: 4px; padding: 9px; color: #bbf7d0;"
-        )
+        privacy.setProperty("role", "notice")
         layout.addWidget(privacy)
         return page
 
@@ -743,13 +807,28 @@ class RviSentinelWindow(QMainWindow):
         layout.setSpacing(10)
         self.analysis_configuration_group = self.create_configuration_group()
         self.analysis_configuration_group.setObjectName("analysisConfiguration")
-        self.analysis_configuration_toggle = QPushButton("Hide settings")
+        self.analysis_configuration_toggle = QPushButton("Show settings")
         self.analysis_configuration_toggle.setObjectName("analysisConfigurationToggle")
         self.analysis_configuration_toggle.setAccessibleName("Show or hide analysis configuration")
         self.analysis_configuration_toggle.clicked.connect(self.toggle_analysis_configuration)
+        self.analysis_configuration_group.hide()
         layout.addWidget(self.analysis_configuration_group)
         layout.addLayout(self.create_action_row())
-        layout.addWidget(self.create_results_tabs(), 1)
+        results = self.create_results_tabs()
+        result_row = QHBoxLayout()
+        result_row.addWidget(QLabel("Show"))
+        self.result_selector.setObjectName("analysisResultSelector")
+        self.result_selector.setAccessibleName("Analysis result page")
+        self.result_selector.setMinimumWidth(160)
+        result_row.addWidget(self.result_selector)
+        result_row.addStretch(1)
+        open_capture = QPushButton("Open capture…")
+        open_capture.setObjectName("analysisOpenCaptureButton")
+        open_capture.clicked.connect(self.choose_capture)
+        result_row.addWidget(open_capture)
+        result_row.addWidget(self.analysis_configuration_toggle)
+        layout.addLayout(result_row)
+        layout.addWidget(results, 1)
         layout.addWidget(self.status_label)
         return page
 
@@ -836,8 +915,11 @@ class RviSentinelWindow(QMainWindow):
         geoip_button.clicked.connect(self.choose_geoip_database)
         return group
 
-    def create_action_row(self) -> QHBoxLayout:
-        layout = QHBoxLayout()
+    def create_action_row(self) -> QGridLayout:
+        layout = QGridLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(4)
+        layout.setVerticalSpacing(2)
         self.analyze_button.setText("Preview analysis")
         self.analyze_button.setObjectName("analyzeButton")
         self.analyze_button.setToolTip("Analyze the saved file without updating the baseline.")
@@ -861,18 +943,14 @@ class RviSentinelWindow(QMainWindow):
 
         requirement = "tshark found" if shutil.which("tshark") else "tshark not found"
         requirement_label = QLabel(requirement)
-        requirement_label.setStyleSheet(
-            "color: #3fb950;" if shutil.which("tshark") else "color: #f85149;"
-        )
-
-        layout.addWidget(self.analyze_button)
-        layout.addWidget(self.cancel_analysis_button)
-        layout.addWidget(self.add_to_baseline_button)
-        layout.addWidget(self.open_exports_button)
-        layout.addWidget(clear_button)
-        layout.addWidget(self.analysis_configuration_toggle)
-        layout.addStretch(1)
-        layout.addWidget(requirement_label)
+        requirement_label.setObjectName("decoderRequirement")
+        layout.addWidget(self.analyze_button, 0, 0)
+        layout.addWidget(self.cancel_analysis_button, 0, 1)
+        layout.addWidget(self.add_to_baseline_button, 0, 2)
+        layout.addWidget(self.open_exports_button, 0, 3)
+        layout.addWidget(clear_button, 0, 4)
+        layout.setColumnStretch(5, 1)
+        layout.addWidget(requirement_label, 0, 6)
         return layout
 
     def create_results_tabs(self) -> QTabWidget:
@@ -902,6 +980,7 @@ class RviSentinelWindow(QMainWindow):
         self.console.setFont(console_font)
         tabs.addTab(self.console, "Console")
         tabs.currentChanged.connect(self.make_evidence_space)
+        tabs.tabBar().hide()
         return tabs
 
     def create_endpoint_tab(self) -> QWidget:
@@ -930,57 +1009,51 @@ class RviSentinelWindow(QMainWindow):
         return page
 
     def create_summary_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        capture_group = QGroupBox("Capture")
-        capture_layout = QFormLayout(capture_group)
-        summary_group = QGroupBox("Observed metadata")
-        summary_layout = QFormLayout(summary_group)
-
-        capture_fields = (
-            ("capture_path", "Path"),
-            ("size_bytes", "Size"),
-            ("packet_count", "Packets"),
-            ("duration", "Duration"),
-            ("first_packet", "First packet"),
-            ("last_packet", "Last packet"),
-            ("capture_digest", "Capture SHA-256"),
-            ("capture_integrity", "Import evidence"),
+        """Show observed counts as cards and retain selectable original-file provenance."""
+        content = QWidget(self)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(2, 4, 2, 4)
+        layout.setSpacing(12)
+        metrics = QGridLayout()
+        metrics.setSpacing(10)
+        fields = (
+            ("packet_count", "Packets"), ("duration", "Duration"),
+            ("endpoints", "Unique endpoints"), ("dns", "Unique DNS names"),
+            ("tls", "Unique TLS SNI"), ("quic", "QUIC-like packets"),
         )
-        summary_fields = (
-            ("endpoints", "Unique endpoints"),
-            ("dns", "Unique DNS names"),
-            ("tls", "Unique TLS SNI"),
-            ("quic", "QUIC-like packets"),
-            ("decoder_coverage", "Decoder coverage"),
-            ("packet_record_count", "Packet records"),
-        )
-
-        for key, label_text in capture_fields:
-            label = QLabel("—")
-            if key == "capture_digest":
-                label.setObjectName("captureDigest")
-            if key == "capture_integrity":
-                label.setObjectName("captureIntegrity")
+        for index, (key, caption) in enumerate(fields):
+            card = QWidget(content)
+            card.setProperty("role", "metricCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            label = plain_label("—", "metricValue", card)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.summary_labels[key] = label
-            capture_layout.addRow(label_text, label)
-
-        for key, label_text in summary_fields:
-            label = QLabel("—")
-            if key == "decoder_coverage":
-                label.setObjectName("decoderCoverage")
-            if key == "packet_record_count":
-                label.setObjectName("packetRecordCount")
+            card_layout.addWidget(label)
+            card_layout.addWidget(plain_label(caption, "metricCaption", card))
+            metrics.addWidget(card, index // 3, index % 3)
+            metrics.setColumnStretch(index % 3, 1)
+        layout.addLayout(metrics)
+        provenance = QGroupBox("Capture evidence", content)
+        form = QFormLayout(provenance)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        for key, caption, name in (
+            ("capture_path", "Path", "capturePath"),
+            ("size_bytes", "Size", "captureSize"),
+            ("first_packet", "First packet", "captureFirstPacket"),
+            ("last_packet", "Last packet", "captureLastPacket"),
+            ("capture_digest", "SHA-256", "captureDigest"),
+            ("capture_integrity", "Import evidence", "captureIntegrity"),
+            ("decoder_coverage", "Decoder coverage", "decoderCoverage"),
+            ("packet_record_count", "Packet records", "packetRecordCount"),
+        ):
+            label = plain_label("—", name, provenance)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.summary_labels[key] = label
-            summary_layout.addRow(label_text, label)
-
-        layout.addWidget(capture_group)
-        layout.addWidget(summary_group)
+            form.addRow(caption, label)
+        layout.addWidget(provenance)
         layout.addStretch(1)
-        return widget
+        return scroll_page(content, "summaryPage", self)
 
     def connect_signals(self) -> None:
         self.capture_field.textChanged.connect(self.suggest_investigation_baseline)
@@ -1017,7 +1090,6 @@ class RviSentinelWindow(QMainWindow):
         self.capture_timer.timeout.connect(self.advance_capture_progress)
         self.retry_traffic_button.clicked.connect(self.retry_traffic_check)
         self.advanced_toggle.toggled.connect(self.set_advanced_details_visible)
-        self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
         self.completion_analyze_button.clicked.connect(self.analyze_completed_capture)
         self.completion_location_button.clicked.connect(self.open_capture_location)
         self.completion_again_button.clicked.connect(self.open_capture_dialog)
@@ -1035,7 +1107,10 @@ class RviSentinelWindow(QMainWindow):
         self.command_label.setVisible(visible)
         console_index = self.results_tabs.indexOf(self.console)
         if console_index >= 0:
+            if not visible and self.results_tabs.currentIndex() == console_index:
+                self.results_tabs.setCurrentIndex(0)
             self.results_tabs.setTabVisible(console_index, visible)
+            self.refresh_result_selector()
 
     def copy_diagnostics(self) -> None:
         checks = "\n".join(
@@ -1060,6 +1135,7 @@ class RviSentinelWindow(QMainWindow):
         )
         QApplication.clipboard().setText(text)
         self.capture_status_label.setText("Redacted diagnostics copied to clipboard.")
+        self.diagnostics_status.setText("Redacted diagnostics copied to clipboard.\n" + text)
 
     def run_setup_checks(self) -> None:
         if self.check_process.state() != QProcess.ProcessState.NotRunning:
@@ -1494,7 +1570,7 @@ class RviSentinelWindow(QMainWindow):
             self.show_error("No verified saved capture", "Wait for a valid final capture receipt before analyzing it.")
             return
         self.capture_field.setText(str(self.completed_capture_path))
-        self.workspace_tabs.setCurrentIndex(1)
+        self.show_destination("analysis")
         self.start_analysis()
 
     def open_capture_location(self) -> None:
@@ -1923,6 +1999,7 @@ class RviSentinelWindow(QMainWindow):
         self.populate_report(report)
         self.start_endpoint_enrichment(report.endpoints)
         self.open_exports_button.setEnabled(True)
+        self.refresh_shortcut_paths()
         if updating_baseline:
             self.status_label.setText(f"Findings added to baseline: {request.baseline_path}")
         else:
@@ -2609,7 +2686,7 @@ class RviSentinelWindow(QMainWindow):
         if len(urls) != 1 or not urls[0].isLocalFile():
             return
         self.select_imported_capture(Path(urls[0].toLocalFile()))
-        self.workspace_tabs.setCurrentIndex(1)
+        self.show_destination("analysis")
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -3054,7 +3131,7 @@ def main(arguments: list[str]) -> int:
     capture_path = initial_capture_path(arguments)
     if capture_path is not None:
         window.capture_field.setText(capture_path)
-        window.workspace_tabs.setCurrentIndex(1)
+        window.show_destination("analysis")
     present_main_window(window)
     QTimer.singleShot(50, lambda: present_main_window(window))
 

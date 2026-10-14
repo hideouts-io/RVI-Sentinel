@@ -26,12 +26,16 @@ from packet_sessions import (
 )
 from packet_timeline import PacketQueryCancelled, PacketQueryValidationError, build_packet_index
 from dns_sessions import DnsSessionIndex, DnsSessionCancelled, DnsSessionValidationError, build_dns_session_index, dns_association_count_for_session
-from packet_view import INSPECTOR_MAX_BYTES, endpoint_label, evidence_tooltip_text, metadata_cell, process_label
+from packet_view import (
+    INSPECTOR_MAX_BYTES, configure_evidence_inspector, configure_evidence_table,
+    endpoint_label, evidence_tooltip_text, metadata_cell, process_label,
+)
 
 COLUMNS = (
     "Transport", "Stream", "Endpoint A", "Endpoint B", "Process", "Effective process",
     "Interface", "Packets", "First exact epoch", "Last exact epoch", "Packet span", "Wire / captured bytes",
 )
+COLUMN_WIDTHS: tuple[int, ...] = (84, 72, 184, 184, 176, 176, 136, 80, 168, 168, 132, 154)
 
 
 def session_span(session: SessionRecord) -> str:
@@ -269,12 +273,15 @@ class SessionTimelineWidget(QWidget):
 
     def _create_controls(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
         explanation = QLabel("Sessions group saved TCP/UDP observations by capture, decoder stream, endpoint pair and recorded metadata scope. They do not prove a connection lifetime or owning process.", self)
         explanation.setObjectName("sessionScopeExplanation")
         explanation.setTextFormat(Qt.TextFormat.PlainText)
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
         filters = QGridLayout()
+        filters.setSpacing(4)
         self.search_field = self._text_control("sessionSearch", "Literal text across recorded scope metadata")
         self.endpoint_field = self._text_control("sessionEndpointFilter", "Exact endpoint IPv4 or IPv6 address")
         self.port_field = self._text_control("sessionPortFilter", "Either endpoint port")
@@ -320,8 +327,9 @@ class SessionTimelineWidget(QWidget):
         ungrouped.addWidget(self.ungrouped_label, 1)
         ungrouped.addWidget(self.ungrouped_button)
         layout.addLayout(ungrouped)
-        splitter = QSplitter(Qt.Orientation.Vertical, self)
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setObjectName("sessionTimelineSplitter")
+        splitter.setChildrenCollapsible(False)
         self.table = QTableView(splitter)
         self.table.setObjectName("sessionTable")
         self.model = SessionPageModel(self.table)
@@ -331,24 +339,34 @@ class SessionTimelineWidget(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(False)
         self.table.setWordWrap(False)
+        configure_evidence_table(self.table, COLUMN_WIDTHS)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         inspector_panel = QWidget(splitter)
+        inspector_panel.setObjectName("sessionInspectorPanel")
         inspector_layout = QVBoxLayout(inspector_panel)
+        inspector_layout.setContentsMargins(6, 6, 6, 6)
+        inspector_layout.setSpacing(4)
         self.selection_notice = QLabel(inspector_panel)
         self.selection_notice.setObjectName("sessionSelectionNotice")
         self.selection_notice.setTextFormat(Qt.TextFormat.PlainText)
         self.selection_notice.setWordWrap(True)
         self.inspector = QPlainTextEdit(inspector_panel)
         self.inspector.setObjectName("sessionInspector")
-        self.inspector.setReadOnly(True)
+        configure_evidence_inspector(self.inspector)
         self.open_button = self._button("sessionOpenPackets", "Show member packets", self.open_member_packets)
         self.dns_button = self._button("sessionShowDnsEvidence", "Show passive DNS evidence", self.open_dns_evidence)
         inspector_layout.addWidget(self.selection_notice)
-        inspector_layout.addWidget(self.inspector)
-        inspector_layout.addWidget(self.open_button)
-        inspector_layout.addWidget(self.dns_button)
+        inspector_layout.addWidget(self.inspector, 1)
+        context_actions = QGridLayout()
+        context_actions.setContentsMargins(0, 0, 0, 0)
+        context_actions.setSpacing(4)
+        context_actions.addWidget(self.open_button, 0, 0)
+        context_actions.addWidget(self.dns_button, 0, 1)
+        inspector_layout.addLayout(context_actions)
         splitter.addWidget(self.table)
         splitter.addWidget(inspector_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
         navigation = QHBoxLayout()
         self.previous_button = self._button("sessionPreviousPage", "Previous page", self.previous_page)
