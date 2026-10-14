@@ -265,7 +265,7 @@ def validate_capture_request(request: CaptureRequest) -> None:
         raise CaptureValidationError(
             f"Capture output must end in {expected_suffix}: {request.output_path}"
         )
-    if request.output_path.exists():
+    if request.output_path.exists() or request.output_path.is_symlink():
         raise CaptureValidationError(
             f"Capture output already exists; choose a new file to avoid overwriting evidence: "
             f"{request.output_path}"

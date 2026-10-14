@@ -33,16 +33,40 @@ jobs:
         run: |
           python -m venv venv
           venv/bin/python -m pip install --disable-pip-version-check -r requirements-gui.txt
+      - name: Install the real saved-file decoder
+        run: brew install wireshark
       - name: Validate Python modules
-        run: venv/bin/python -m py_compile analyze.py capture_models.py capture_devices.py capture_session.py capture_mobile.py gui.py gui_models.py enrich_endpoints.py finding_enrichment.py
+        run: venv/bin/python -m py_compile analyze.py analyze_preview.py analyze_reviewed.py analyze_captured.py analysis_baseline.py packet_models.py pcapng_process.py saved_capture.py captured_dns.py dns_sessions.py dns_view.py capture_models.py capture_devices.py capture_session.py capture_receipt.py capture_stats.py capture_mobile.py gui.py gui_models.py packet_timeline.py packet_view.py packet_sessions.py session_view.py report_loader.py enrich_endpoints.py local_endpoint_enrichment.py finding_enrichment.py
       - name: Run deterministic analyzer and model tests
         run: |
           venv/bin/python tests/test_analyzer.py
           venv/bin/python -m tests.test_capture_models
           venv/bin/python -m tests.test_gui_models
           venv/bin/python -m tests.test_finding_enrichment
+      - name: Run real saved-file decoder integrations
+        run: |
+          venv/bin/python -m tests.test_saved_capture
+          venv/bin/python -m tests.test_pcapng_process
+          venv/bin/python -m tests.test_capture_stats
+          venv/bin/python -m tests.test_capture_receipts
       - name: Run offscreen GUI integration tests
         run: venv/bin/python -m tests.test_gui_integration
+      - name: Run packet query and Qt timeline integrations
+        run: |
+          venv/bin/python -m tests.test_packet_timeline
+          venv/bin/python -X faulthandler -m tests.test_packet_view
+          venv/bin/python -X faulthandler -m tests.test_packet_gui_integration
+      - name: Run scoped session and Qt navigation integrations
+        run: |
+          venv/bin/python -m tests.test_packet_sessions
+          venv/bin/python -X faulthandler -m tests.test_session_view
+          venv/bin/python -X faulthandler -m tests.test_session_gui_integration
+      - name: Run passive DNS evidence and Qt navigation integrations
+        run: |
+          venv/bin/python -m tests.test_captured_dns
+          venv/bin/python -m tests.test_dns_sessions
+          venv/bin/python -X faulthandler -m tests.test_dns_view
+          venv/bin/python -X faulthandler -m tests.test_dns_gui_integration
       - name: Compile and smoke-test the native launcher
         env:
           TMPDIR: ${{ runner.temp }}

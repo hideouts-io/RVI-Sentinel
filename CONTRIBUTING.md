@@ -44,17 +44,39 @@ The analyzer requires `tshark`. Live capture has additional platform-specific pr
 Run the checks relevant to your change. For a complete analyzer and GUI change, run:
 
 ```bash
-python3 -m py_compile analyze.py capture_models.py capture_devices.py capture_session.py capture_mobile.py gui.py gui_models.py enrich_endpoints.py finding_enrichment.py
+venv/bin/python -m py_compile analyze.py analyze_preview.py analyze_reviewed.py analyze_captured.py analysis_baseline.py packet_models.py pcapng_process.py saved_capture.py captured_dns.py dns_sessions.py dns_view.py capture_models.py capture_devices.py capture_session.py capture_receipt.py capture_stats.py capture_mobile.py gui.py gui_models.py packet_timeline.py packet_view.py packet_sessions.py session_view.py report_loader.py enrich_endpoints.py local_endpoint_enrichment.py finding_enrichment.py
 python3 tests/test_analyzer.py
 venv/bin/python -m tests.test_capture_models
 venv/bin/python -m tests.test_gui_models
 venv/bin/python -m tests.test_finding_enrichment
+venv/bin/python -m tests.test_saved_capture
+venv/bin/python -m tests.test_pcapng_process
+venv/bin/python -m tests.test_capture_stats
+venv/bin/python -m tests.test_capture_receipts
 QT_QPA_PLATFORM=offscreen venv/bin/python -m tests.test_gui_integration
+venv/bin/python -m tests.test_packet_timeline
+QT_QPA_PLATFORM=offscreen venv/bin/python -X faulthandler -m tests.test_packet_view
+QT_QPA_PLATFORM=offscreen venv/bin/python -X faulthandler -m tests.test_packet_gui_integration
+venv/bin/python -m tests.test_packet_sessions
+QT_QPA_PLATFORM=offscreen venv/bin/python -X faulthandler -m tests.test_session_view
+QT_QPA_PLATFORM=offscreen venv/bin/python -X faulthandler -m tests.test_session_gui_integration
+venv/bin/python -m tests.test_captured_dns
+venv/bin/python -m tests.test_dns_sessions
+QT_QPA_PLATFORM=offscreen venv/bin/python -X faulthandler -m tests.test_dns_view
+QT_QPA_PLATFORM=offscreen venv/bin/python -X faulthandler -m tests.test_dns_gui_integration
 ./scripts/run_gui.sh --smoke-test
 git diff --check
 ```
 
 Platform-specific capture changes should also be exercised on the affected operating system and owned or explicitly authorized hardware. State clearly when a platform or live-device path was not tested.
+
+The saved-file integration suite requires real TShark on PATH and fails if it is missing. It generates valid PCAP/PCAPNG bytes in temporary directories, uses reserved addresses and names, and performs no live capture or public PTR lookup. It replaces source directories during real decoding to verify pinned original input across packet, structured DNS and streaming artifact passes, and denies baseline growth before it could replace readable history. The artifact suite includes a real 200,001-frame streaming reduction and corrupt-tail cases. Receipt lifecycle tests execute the generated native shell against task-owned synthetic recorders and exercise controlled device/tool connector boundaries. They do not invoke actual tcpdump, rvictl, administrator authorization, or a physical device. Deterministic fake-decoder checks remain useful for process/report/baseline contracts; they do not establish real decoding.
+
+The packet GUI suite also exercises generated real-decoder reports, literal inspector presentation, metadata conflicts, stable selection, paged queries, cancellation, stale report generations, FIFO/link races, and application Quit while owned workers are active. Its 50k/100k query measurements use a generated repeated-metadata corpus and report process high-water RSS and event-loop gaps. On macOS, run the same suite with `QT_QPA_PLATFORM=cocoa` to exercise shown native widgets; offscreen results alone do not establish native scrolling or hardware capture.
+
+The session suites verify exact bidirectional grouping, every scope boundary and exclusion reason, original record membership, complete frame partitioning, byte/time summaries, combined filters, bounded pages, capture-bound return navigation and owned-worker shutdown. Real TShark decodes small generated classic PCAP and Apple-metadata PCAPNG fixtures. Separate 50k/100k-frame Qt measurements use diverse synthetic records with 25k/50k sessions and varied regular/effective process and interface labels; they report RSS and event-loop gaps without claiming full-capacity responsiveness. Run the widget and session GUI suites with `QT_QPA_PLATFORM=cocoa` for native macOS evidence, including table/inspector layout and application Quit.
+
+The DNS suites decode generated saved PCAP/PCAPNG with real TShark, round-trip structured evidence, and exercise query links, message/answer boundaries, CNAME chains, A/AAAA replacement rules, TTL expiry, NXDOMAIN/NODATA, extended response codes, exact client/interface/session scope, cancellation and explicit resource failures. Qt checks navigate between candidates, original query/response/superseding packets, matched member frames and scoped sessions; they verify return state, same-digest report replacement, literal inspectors and owned-worker shutdown while capture, baseline and exports remain unchanged. Run `tests.test_dns_view` and `tests.test_dns_gui_integration` with `QT_QPA_PLATFORM=cocoa` for shown native macOS widgets. These small synthetic integrations do not establish physical-device metadata, DNS authenticity, application name use or DNS-heavy full-capacity performance.
 
 ## Pull requests
 

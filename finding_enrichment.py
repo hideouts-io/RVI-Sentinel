@@ -7,9 +7,10 @@ import ipaddress
 import json
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Mapping, cast
+from typing import Literal, Mapping, TypedDict, cast
 
 import maxminddb
 from maxminddb.reader import Reader
@@ -22,6 +23,31 @@ class EndpointEnrichment:
     scope: str
     location: str
     resolution_note: str
+
+
+@dataclass(frozen=True)
+class EndpointEnrichmentResult:
+    """Separate local or current-resolver evidence from captured packet findings."""
+
+    endpoints: tuple[EndpointEnrichment, ...]
+    evidence_source: Literal["local", "ptr"]
+    requested_at: datetime
+    completed_at: datetime
+
+
+class EndpointEnrichmentRow(TypedDict):
+    address: str
+    hostname: str
+    scope: str
+    location: str
+    resolution_note: str
+
+
+class EndpointEnrichmentPayload(TypedDict):
+    endpoints: list[EndpointEnrichmentRow]
+    evidence_source: Literal["local", "ptr"]
+    requested_at: str
+    completed_at: str
 
 
 @dataclass(frozen=True)
@@ -176,48 +202,136 @@ def enrich_endpoints(
 ) -> tuple[EndpointEnrichment, ...]:
     if dns_attempts < 1:
         raise ValueError("Reverse DNS attempts must be at least one.")
+    local_endpoints = enrich_local_endpoints(addresses, geo_database_path)
+    worker_count = min(16, max(1, len(local_endpoints)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        hostname_results = tuple(
+            executor.map(
+                lambda endpoint: reverse_hostname(endpoint.address, dns_attempts),
+                local_endpoints,
+            )
+        )
+    return tuple(
+        replace(endpoint, hostname=hostname_result[0], resolution_note=hostname_result[1])
+        for endpoint, hostname_result in zip(local_endpoints, hostname_results, strict=True)
+    )
+
+
+def enrich_local_endpoints(
+    addresses: tuple[str, ...], geo_database_path: Path | None
+) -> tuple[EndpointEnrichment, ...]:
+    """Read optional local MMDB data without invoking a network resolver."""
+
     parsed_addresses = tuple(str(ipaddress.ip_address(address)) for address in addresses)
     reader = open_geo_database(geo_database_path)
     try:
-        worker_count = min(16, max(1, len(parsed_addresses)))
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            hostname_results = tuple(
-                executor.map(
-                    lambda address: reverse_hostname(address, dns_attempts), parsed_addresses
-                )
-            )
-        return tuple(
-            EndpointEnrichment(
-                address=address,
-                hostname=hostname_result[0],
-                scope=classify_address(address),
-                location=location_for(address, reader, geo_database_path),
-                resolution_note=hostname_result[1],
-            )
-            for address, hostname_result in zip(
-                parsed_addresses, hostname_results, strict=True
-            )
+        locations = tuple(
+            location_for(address, reader, geo_database_path) for address in parsed_addresses
         )
+        return local_endpoint_findings(parsed_addresses, locations)
     finally:
         if reader is not None:
             reader.close()
 
 
+def local_endpoint_findings(
+    addresses: tuple[str, ...], locations: tuple[str, ...]
+) -> tuple[EndpointEnrichment, ...]:
+    """Build passive endpoint context; PTR names require a separate explicit request."""
+
+    return tuple(
+        EndpointEnrichment(
+            address=address,
+            hostname="Not requested",
+            scope=classify_address(address),
+            location=location,
+            resolution_note="PTR not requested. Scope and GeoIP context use local data only.",
+        )
+        for address, location in zip(addresses, locations, strict=True)
+    )
+
+
+def enrichment_payload(result: EndpointEnrichmentResult) -> EndpointEnrichmentPayload:
+    return {
+        "endpoints": [
+            {
+                "address": endpoint.address,
+                "hostname": endpoint.hostname,
+                "scope": endpoint.scope,
+                "location": endpoint.location,
+                "resolution_note": endpoint.resolution_note,
+            }
+            for endpoint in result.endpoints
+        ],
+        "evidence_source": result.evidence_source,
+        "requested_at": result.requested_at.isoformat(),
+        "completed_at": result.completed_at.isoformat(),
+    }
+
+
+def parse_enrichment_result_output(payload_text: str) -> EndpointEnrichmentResult:
+    root = enrichment_output_root(payload_text)
+    source: Literal["local", "ptr"]
+    if root.get("evidence_source") == "local":
+        source = "local"
+    elif root.get("evidence_source") == "ptr":
+        source = "ptr"
+    else:
+        raise ValueError("Endpoint enrichment evidence_source must be local or ptr.")
+    requested_at = require_enrichment_timestamp(root, "requested_at")
+    completed_at = require_enrichment_timestamp(root, "completed_at")
+    if completed_at < requested_at:
+        raise ValueError("Endpoint enrichment completed_at precedes requested_at.")
+    return EndpointEnrichmentResult(
+        endpoints=parse_endpoint_values(root.get("endpoints")),
+        evidence_source=source,
+        requested_at=requested_at,
+        completed_at=completed_at,
+    )
+
+
+def require_enrichment_timestamp(mapping: Mapping[str, object], key: str) -> datetime:
+    value = mapping.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"Endpoint enrichment {key} must be a timestamp string.")
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"Endpoint enrichment {key} is not an ISO 8601 timestamp.") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError(f"Endpoint enrichment {key} must include a timezone.")
+    return timestamp
+
+
 def parse_enrichment_output(payload_text: str) -> tuple[EndpointEnrichment, ...]:
+    return parse_endpoint_values(enrichment_output_root(payload_text).get("endpoints"))
+
+
+def enrichment_output_root(payload_text: str) -> Mapping[str, object]:
     try:
         payload: object = json.loads(payload_text)
     except json.JSONDecodeError as error:
         raise ValueError(f"Endpoint enrichment output is not valid JSON: {error}") from error
-    root = require_object(payload, "enrichment output")
-    endpoint_values = root.get("endpoints")
+    return require_object(payload, "enrichment output")
+
+
+def parse_endpoint_values(endpoint_values: object) -> tuple[EndpointEnrichment, ...]:
     if not isinstance(endpoint_values, list):
         raise ValueError("Endpoint enrichment output must contain an endpoints array.")
     findings: list[EndpointEnrichment] = []
+    seen_addresses: set[str] = set()
     for index, endpoint_value in enumerate(endpoint_values):
         endpoint = require_object(endpoint_value, f"endpoints[{index}]")
+        address = require_text(endpoint, "address", index)
+        parsed_address = str(ipaddress.ip_address(address))
+        if parsed_address != address:
+            raise ValueError(f"endpoints[{index}].address must use its canonical IP spelling.")
+        if address in seen_addresses:
+            raise ValueError(f"Endpoint enrichment repeats address: {address}")
+        seen_addresses.add(address)
         findings.append(
             EndpointEnrichment(
-                address=require_text(endpoint, "address", index),
+                address=address,
                 hostname=require_text(endpoint, "hostname", index),
                 scope=require_text(endpoint, "scope", index),
                 location=require_text(endpoint, "location", index),

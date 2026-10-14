@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve endpoint PTR names and local GeoIP locations for the GUI."""
+"""Explicitly query current PTR names and optional local GeoIP locations."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-from finding_enrichment import enrich_endpoints
+from finding_enrichment import EndpointEnrichmentResult, enrich_endpoints, enrichment_payload
 from maxminddb.errors import InvalidDatabaseError
 
 
@@ -21,7 +22,7 @@ class EnrichmentRequest:
 
 def parse_args(arguments: list[str]) -> EnrichmentRequest:
     parser = argparse.ArgumentParser(
-        description="Resolve endpoint names and query an optional local GeoIP MMDB database."
+        description="Read endpoint addresses and an optional local GeoIP MMDB database path."
     )
     parser.add_argument("--geo-db", type=Path)
     parser.add_argument("addresses", nargs="+")
@@ -43,6 +44,7 @@ def parse_args(arguments: list[str]) -> EnrichmentRequest:
 def main(arguments: list[str]) -> int:
     try:
         request = parse_args(arguments)
+        requested_at = datetime.now(timezone.utc)
         findings = enrich_endpoints(
             request.addresses, request.geo_database_path, 2
         )
@@ -50,19 +52,13 @@ def main(arguments: list[str]) -> int:
         print(f"Endpoint enrichment failed: {error}", file=sys.stderr)
         return 2
 
-    payload = {
-        "endpoints": [
-            {
-                "address": finding.address,
-                "hostname": finding.hostname,
-                "scope": finding.scope,
-                "location": finding.location,
-                "resolution_note": finding.resolution_note,
-            }
-            for finding in findings
-        ]
-    }
-    json.dump(payload, sys.stdout, sort_keys=True)
+    result = EndpointEnrichmentResult(
+        endpoints=findings,
+        evidence_source="ptr",
+        requested_at=requested_at,
+        completed_at=datetime.now(timezone.utc),
+    )
+    json.dump(enrichment_payload(result), sys.stdout, sort_keys=True)
     return 0
 
 

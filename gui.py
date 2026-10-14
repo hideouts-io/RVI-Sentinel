@@ -9,12 +9,15 @@ import sys
 import platform
 import hashlib
 import json
+import re
 import tempfile
-import time
+import uuid
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
-from PySide6.QtCore import QLockFile, QProcess, QProcessEnvironment, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QLockFile, QObject, QProcess, QProcessEnvironment, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -62,7 +65,6 @@ from gui_models import (
     ReportValidationError,
     RequestValidationError,
     analyzer_arguments,
-    load_report,
     report_path_for,
 )
 from capture_models import (
@@ -81,18 +83,40 @@ from capture_models import (
 )
 from finding_enrichment import (
     EndpointEnrichment,
+    EndpointEnrichmentResult,
     classify_address,
     describe_port,
-    parse_enrichment_output,
+    parse_enrichment_result_output,
+)
+from capture_receipt import (
+    CAPTURE_RECEIPT_EVENT,
+    MAXIMUM_RECEIPT_BYTES,
+    CaptureReceipt,
+    CaptureReceiptError,
+    parse_capture_receipt,
+    receipt_is_success,
+    validate_receipt_binding,
 )
 from macos_application import set_macos_application_icon
+from report_loader import ReportLoadWorker
+from packet_view import PacketTimelineWidget, PacketNavigation
+from session_view import SessionTimelineWidget, SessionNavigation
+from dns_view import DnsSessionWidget, DnsNavigation
+from dns_sessions import DnsAssociationIdentity, DnsSessionValidationError, dns_association_for_identity, observed_dns_frames, dns_messages_for_frame, dns_diagnostics_for_frame
+from packet_timeline import PacketIdentity, PacketQueryValidationError
+from packet_sessions import (
+    SessionIdentity, SessionValidationError, session_for_identity, session_for_packet,
+    frames_for_session, ungrouped_for_packet,
+)
 
 ROOT = Path(__file__).resolve().parent
 ANALYZER = ROOT / "analyze.py"
 ANALYZER_PREVIEW = ROOT / "analyze_preview.py"
+CAPTURE_ANALYZER = ROOT / "analyze_captured.py"
+REVIEWED_ANALYZER = ROOT / "analyze_reviewed.py"
 SETUP_CHECKS = ROOT / "setup_checks.py"
-CAPTURE_STATS = ROOT / "capture_stats.py"
 ENDPOINT_ENRICHER = ROOT / "enrich_endpoints.py"
+LOCAL_ENDPOINT_ENRICHER = ROOT / "local_endpoint_enrichment.py"
 DEVICE_DISCOVERY = ROOT / "capture_devices.py"
 CAPTURE_SESSION = ROOT / "capture_session.py"
 CAPTURE_SUPPORT_SETUP = ROOT / "scripts" / "setup_rvi_capture.py"
@@ -100,6 +124,17 @@ DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
 DEFAULT_CAPTURE_DIRECTORY = ROOT / "captures"
 APP_ICON = ROOT / "assets" / "rvi-sentinel-app-icon.png"
 GUI_INSTANCE_LOCK = Path(tempfile.gettempdir()) / "rvi-sentinel-gui.lock"
+
+
+def passive_analysis_arguments(
+    request: AnalysisRequest, receipt: CaptureReceipt | None,
+    preview_script: Path, captured_script: Path,
+) -> tuple[list[str], str | None]:
+    """Bind guided passive exports to the verified receipt's original-byte digest."""
+    if receipt is not None and receipt.artifact is not None and request.capture_path == receipt.output_path:
+        digest = receipt.artifact.sha256
+        return [*analyzer_arguments(request, captured_script), "--expected-sha256", digest], digest
+    return analyzer_arguments(request, preview_script), None
 
 
 class GuiInstanceAlreadyRunningError(RuntimeError):
@@ -286,7 +321,18 @@ def capture_permission_note(host_system: str) -> str:
     return f"iOS capture is not supported on {host_system}."
 
 
+@dataclass(frozen=True)
+class ReportLoadContext:
+    generation: int
+    request: AnalysisRequest
+    path: Path
+    expected_sha256: str | None
+    baseline_update: bool
+
+
 class RviSentinelWindow(QMainWindow):
+    report_load_finished = Signal()
+
     """Main capture and analysis window backed by the existing CLI tools."""
 
     def __init__(self) -> None:
@@ -297,12 +343,20 @@ class RviSentinelWindow(QMainWindow):
         self.capture_process = QProcess(self)
         self.setup_process = QProcess(self)
         self.check_process = QProcess(self)
-        self.stats_process = QProcess(self)
         self.enrichment_timer = QTimer(self)
         self.enrichment_timer.setSingleShot(True)
+        self.analysis_cancel_timer = QTimer(self)
+        self.analysis_cancel_timer.setSingleShot(True)
+        self.capture_cancel_timer = QTimer(self)
+        self.capture_cancel_timer.setSingleShot(True)
         self.capture_timer = QTimer(self)
         self.capture_timer.setInterval(1_000)
         self.enrichment_timed_out = False
+        self.enrichment_cancel_requested = False
+        self.analysis_cancel_requested = False
+        self.endpoint_findings: tuple[RankedFinding, ...] = ()
+        self.active_enrichment_source: Literal["local", "ptr"] | None = None
+        self.endpoint_enrichment_result: EndpointEnrichmentResult | None = None
         self.active_request: AnalysisRequest | None = None
         self.active_report_path: Path | None = None
         self.active_capture_request: CaptureRequest | None = None
@@ -312,19 +366,60 @@ class RviSentinelWindow(QMainWindow):
         self.capture_event_buffer = ""
         self.capture_error_buffer = ""
         self.capture_cancel_requested = False
+        self.capture_request_id: str | None = None
+        self.capture_receipt: CaptureReceipt | None = None
+        self.capture_receipt_error: str | None = None
+        self.completed_capture_receipt: CaptureReceipt | None = None
+        self.active_analysis_capture_sha256: str | None = None
         self.capture_no_traffic = False
-        self.capture_started_at: float | None = None
-        self.capture_actual_seconds: float | None = None
         self.last_capture_request: CaptureRequest | None = None
         self.completed_capture_path: Path | None = None
         self.preview_request: AnalysisRequest | None = None
+        self.preview_sha256: str | None = None
+        self.baseline_updated_for_report = False
         self.updating_baseline = False
         self.manual_baseline_selected = False
         self.setup_check_results: list[tuple[str, bool]] = []
         self.summary_labels: dict[str, QLabel] = {}
 
+        self.report_worker: ReportLoadWorker | None = None
+        self.report_load_context: ReportLoadContext | None = None
+        self.pending_report_load: ReportLoadContext | None = None
+        self.report_generation = 0
+        self.report_loading = False
+        self.closing_requested = False
+        self.quit_requested = False
         self.workspace_tabs = QTabWidget()
         self.results_tabs = QTabWidget()
+        self.packet_timeline = PacketTimelineWidget(self)
+        self.packet_timeline.shutdown_complete.connect(self.continue_close)
+        self.session_timeline = SessionTimelineWidget(self)
+        self.session_timeline.shutdown_complete.connect(self.continue_close)
+        self.session_timeline.session_open_requested.connect(self.show_session_members)
+        self.session_timeline.ungrouped_open_requested.connect(self.show_ungrouped_packets)
+        self.session_timeline.packet_return_requested.connect(self.return_from_session_to_packets)
+        self.session_timeline.index_ready.connect(self.refresh_packet_session_context)
+        self.dns_evidence_view = DnsSessionWidget(self)
+        self.dns_evidence_view.shutdown_complete.connect(self.continue_close)
+        self.session_timeline.dns_evidence_requested.connect(self.show_session_dns_evidence)
+        self.session_timeline.dns_return_requested.connect(self.return_to_dns_evidence)
+        self.packet_timeline.return_dns_requested.connect(self.return_to_dns_evidence)
+        self.dns_evidence_view.query_packet_requested.connect(self.show_dns_packet)
+        self.dns_evidence_view.response_packet_requested.connect(self.show_dns_packet)
+        self.dns_evidence_view.superseding_packet_requested.connect(self.show_dns_packet)
+        self.dns_evidence_view.matched_packets_requested.connect(self.show_dns_matched_packets)
+        self.dns_evidence_view.session_requested.connect(self.show_dns_session)
+        self.dns_evidence_view.observed_packets_requested.connect(self.show_observed_dns_packets)
+        self.dns_evidence_view.return_session_requested.connect(self.return_from_dns_to_session)
+        self.dns_navigation_origin: DnsNavigation | None = None
+        self.dns_session_origin: SessionNavigation | None = None
+        self.packet_timeline.packet_selected.connect(self.update_packet_session_context)
+        self.packet_timeline.owning_session_requested.connect(self.show_owning_session)
+        self.packet_timeline.back_to_sessions_requested.connect(self.return_to_sessions)
+        self.packet_timeline.restore_timeline_requested.connect(self.return_to_packet_context)
+        self.session_navigation_origin: SessionNavigation | None = None
+        self.packet_navigation_origin: PacketNavigation | None = None
+        self.packet_session_jump_origin: PacketNavigation | None = None
         self.device_table = create_device_table()
         self.capture_status_label = QLabel("Connect and unlock an iPhone or iPad, then refresh devices.")
         self.capture_progress = QProgressBar()
@@ -336,7 +431,7 @@ class RviSentinelWindow(QMainWindow):
         self.retry_traffic_button = QPushButton("Retry Traffic Check")
         self.advanced_toggle = QCheckBox("Advanced details")
         self.copy_diagnostics_button = QPushButton("Copy diagnostics")
-        self.completion_group = QGroupBox("Capture complete")
+        self.completion_group = QGroupBox("Saved capture evidence")
         self.completion_summary = QLabel()
         self.completion_analyze_button = QPushButton("Analyze without updating baseline")
         self.completion_location_button = QPushButton("Open file location")
@@ -356,8 +451,16 @@ class RviSentinelWindow(QMainWindow):
         self.console = QTextEdit()
         self.interpretation = QTextEdit()
         self.analyze_button = QPushButton("Analyze Capture")
-        self.add_to_baseline_button = QPushButton("Add findings to baseline")
-        self.open_exports_button = QPushButton("Open Export Folder")
+        self.cancel_analysis_button = QPushButton("Cancel")
+        self.add_to_baseline_button = QPushButton("Update baseline")
+        self.open_exports_button = QPushButton("Open exports")
+        self.resolve_ptr_button = QPushButton("Resolve current PTR names")
+        self.cancel_enrichment_button = QPushButton("Cancel endpoint lookup")
+        self.ptr_resolver_notice = QLabel(
+            "PTR is optional: this action sends endpoint addresses to the configured DNS resolver. "
+            "Current PTR names are separate from captured DNS/SNI and do not change reports or baselines."
+        )
+        self.enrichment_status_label = QLabel("Local endpoint context appears after analysis; PTR is not requested.")
 
         self.endpoints_table = create_endpoint_table()
         self.domains_table = create_ranked_table(("DNS name", "Queries", "Baseline"))
@@ -393,7 +496,7 @@ class RviSentinelWindow(QMainWindow):
                 font-weight: 600;
             }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
                 background: #111827;
                 border: 1px solid #374151;
                 border-radius: 6px;
@@ -409,7 +512,7 @@ class RviSentinelWindow(QMainWindow):
                 min-height: 20px;
             }
             QProgressBar::chunk { background: #1f6feb; border-radius: 5px; }
-            QTableWidget {
+            QTableWidget, QTableView {
                 background: #111827;
                 alternate-background-color: #0f172a;
                 border: 1px solid #374151;
@@ -579,6 +682,8 @@ class RviSentinelWindow(QMainWindow):
         completion_layout = QVBoxLayout(self.completion_group)
         self.completion_group.setObjectName("captureCompletionCard")
         self.completion_summary.setObjectName("captureCompletionSummary")
+        self.completion_analyze_button.setObjectName("analyzeSavedCaptureButton")
+        self.completion_location_button.setObjectName("openSavedCaptureLocationButton")
         self.completion_summary.setWordWrap(True)
         self.completion_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         completion_layout.addWidget(self.completion_summary)
@@ -636,11 +741,30 @@ class RviSentinelWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-        layout.addWidget(self.create_configuration_group())
+        self.analysis_configuration_group = self.create_configuration_group()
+        self.analysis_configuration_group.setObjectName("analysisConfiguration")
+        self.analysis_configuration_toggle = QPushButton("Hide settings")
+        self.analysis_configuration_toggle.setObjectName("analysisConfigurationToggle")
+        self.analysis_configuration_toggle.setAccessibleName("Show or hide analysis configuration")
+        self.analysis_configuration_toggle.clicked.connect(self.toggle_analysis_configuration)
+        layout.addWidget(self.analysis_configuration_group)
         layout.addLayout(self.create_action_row())
         layout.addWidget(self.create_results_tabs(), 1)
         layout.addWidget(self.status_label)
         return page
+
+    @Slot()
+    def toggle_analysis_configuration(self) -> None:
+        visible = self.analysis_configuration_group.isHidden()
+        self.analysis_configuration_group.setVisible(visible)
+        self.analysis_configuration_toggle.setText("Hide settings" if visible else "Show settings")
+
+    @Slot(int)
+    def make_evidence_space(self, index: int) -> None:
+        """Keep packet/session rows and inspectors visible on ordinary screens."""
+        if self.results_tabs.widget(index) in (self.packet_timeline, self.session_timeline, self.dns_evidence_view):
+            self.analysis_configuration_group.hide()
+            self.analysis_configuration_toggle.setText("Show settings")
 
     def create_configuration_group(self) -> QGroupBox:
         group = QGroupBox("Analysis configuration")
@@ -714,16 +838,23 @@ class RviSentinelWindow(QMainWindow):
 
     def create_action_row(self) -> QHBoxLayout:
         layout = QHBoxLayout()
-        self.analyze_button.setText("Analyze without updating baseline")
+        self.analyze_button.setText("Preview analysis")
         self.analyze_button.setObjectName("analyzeButton")
+        self.analyze_button.setToolTip("Analyze the saved file without updating the baseline.")
+        self.analyze_button.setAccessibleName("Analyze the saved file without updating the baseline")
+        self.cancel_analysis_button.setObjectName("cancelAnalysisButton")
+        self.cancel_analysis_button.setAccessibleName("Cancel current capture-file analysis")
+        self.cancel_analysis_button.setEnabled(False)
         self.add_to_baseline_button.setObjectName("addToBaselineButton")
+        self.add_to_baseline_button.setToolTip("Apply the reviewed findings to the selected baseline after verifying the original capture.")
         self.add_to_baseline_button.setEnabled(False)
         self.open_exports_button.setObjectName("openExportsButton")
         self.open_exports_button.setEnabled(DEFAULT_EXPORT_DIRECTORY.exists())
-        clear_button = QPushButton("Clear Results")
+        clear_button = QPushButton("Clear")
         clear_button.setObjectName("clearResultsButton")
 
         self.analyze_button.clicked.connect(self.start_analysis)
+        self.cancel_analysis_button.clicked.connect(self.cancel_analysis)
         self.add_to_baseline_button.clicked.connect(self.add_findings_to_baseline)
         self.open_exports_button.clicked.connect(self.open_export_directory)
         clear_button.clicked.connect(self.clear_results)
@@ -735,9 +866,11 @@ class RviSentinelWindow(QMainWindow):
         )
 
         layout.addWidget(self.analyze_button)
+        layout.addWidget(self.cancel_analysis_button)
         layout.addWidget(self.add_to_baseline_button)
         layout.addWidget(self.open_exports_button)
         layout.addWidget(clear_button)
+        layout.addWidget(self.analysis_configuration_toggle)
         layout.addStretch(1)
         layout.addWidget(requirement_label)
         return layout
@@ -746,13 +879,16 @@ class RviSentinelWindow(QMainWindow):
         tabs = self.results_tabs
         tabs.setDocumentMode(True)
         tabs.addTab(self.create_summary_tab(), "Summary")
+        tabs.addTab(self.packet_timeline, "Packets")
+        tabs.addTab(self.session_timeline, "Sessions")
+        tabs.addTab(self.dns_evidence_view, "DNS evidence")
         self.interpretation.setReadOnly(True)
         self.interpretation.setAccessibleName("Findings interpretation")
         self.interpretation.setPlainText(
             "Analyze a capture to receive a plain-language explanation of the findings."
         )
         tabs.addTab(self.interpretation, "Interpretation")
-        tabs.addTab(self.endpoints_table, "Endpoints")
+        tabs.addTab(self.create_endpoint_tab(), "Endpoints")
         tabs.addTab(self.domains_table, "DNS")
         tabs.addTab(self.tls_table, "TLS SNI")
         tabs.addTab(self.protocols_table, "Protocols")
@@ -765,7 +901,33 @@ class RviSentinelWindow(QMainWindow):
         console_font.setStyleHint(QFont.StyleHint.Monospace)
         self.console.setFont(console_font)
         tabs.addTab(self.console, "Console")
+        tabs.currentChanged.connect(self.make_evidence_space)
         return tabs
+
+    def create_endpoint_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.resolve_ptr_button.setObjectName("resolvePtrButton")
+        self.resolve_ptr_button.setAccessibleName("Resolve current PTR names using the configured DNS resolver")
+        self.resolve_ptr_button.setEnabled(False)
+        self.cancel_enrichment_button.setObjectName("cancelEnrichmentButton")
+        self.cancel_enrichment_button.setAccessibleName("Cancel current endpoint lookup")
+        self.cancel_enrichment_button.setEnabled(False)
+        self.ptr_resolver_notice.setObjectName("ptrResolverNotice")
+        self.ptr_resolver_notice.setWordWrap(True)
+        self.enrichment_status_label.setObjectName("endpointEnrichmentStatus")
+        self.enrichment_status_label.setWordWrap(True)
+        self.resolve_ptr_button.clicked.connect(self.resolve_current_ptr_names)
+        self.cancel_enrichment_button.clicked.connect(self.cancel_endpoint_enrichment)
+        actions = QHBoxLayout()
+        actions.addWidget(self.resolve_ptr_button)
+        actions.addWidget(self.cancel_enrichment_button)
+        actions.addStretch(1)
+        layout.addWidget(self.ptr_resolver_notice)
+        layout.addLayout(actions)
+        layout.addWidget(self.endpoints_table, 1)
+        layout.addWidget(self.enrichment_status_label)
+        return page
 
     def create_summary_tab(self) -> QWidget:
         widget = QWidget()
@@ -783,22 +945,34 @@ class RviSentinelWindow(QMainWindow):
             ("duration", "Duration"),
             ("first_packet", "First packet"),
             ("last_packet", "Last packet"),
+            ("capture_digest", "Capture SHA-256"),
+            ("capture_integrity", "Import evidence"),
         )
         summary_fields = (
             ("endpoints", "Unique endpoints"),
             ("dns", "Unique DNS names"),
             ("tls", "Unique TLS SNI"),
             ("quic", "QUIC-like packets"),
+            ("decoder_coverage", "Decoder coverage"),
+            ("packet_record_count", "Packet records"),
         )
 
         for key, label_text in capture_fields:
             label = QLabel("—")
+            if key == "capture_digest":
+                label.setObjectName("captureDigest")
+            if key == "capture_integrity":
+                label.setObjectName("captureIntegrity")
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.summary_labels[key] = label
             capture_layout.addRow(label_text, label)
 
         for key, label_text in summary_fields:
             label = QLabel("—")
+            if key == "decoder_coverage":
+                label.setObjectName("decoderCoverage")
+            if key == "packet_record_count":
+                label.setObjectName("packetRecordCount")
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.summary_labels[key] = label
             summary_layout.addRow(label_text, label)
@@ -821,6 +995,7 @@ class RviSentinelWindow(QMainWindow):
         self.process.readyReadStandardError.connect(self.read_standard_error)
         self.process.finished.connect(self.analysis_finished)
         self.process.errorOccurred.connect(self.process_error)
+        self.analysis_cancel_timer.timeout.connect(self.force_stop_analysis)
         self.enrichment_process.finished.connect(self.endpoint_enrichment_finished)
         self.enrichment_process.errorOccurred.connect(self.endpoint_enrichment_error)
         self.enrichment_timer.timeout.connect(self.endpoint_enrichment_timeout)
@@ -834,6 +1009,7 @@ class RviSentinelWindow(QMainWindow):
         self.capture_process.readyReadStandardError.connect(self.read_capture_error)
         self.capture_process.finished.connect(self.capture_finished)
         self.capture_process.errorOccurred.connect(self.capture_process_error)
+        self.capture_cancel_timer.timeout.connect(self.force_kill_capture)
         self.setup_process.readyReadStandardOutput.connect(self.read_setup_output)
         self.setup_process.readyReadStandardError.connect(self.read_setup_error)
         self.setup_process.finished.connect(self.capture_support_finished)
@@ -848,8 +1024,6 @@ class RviSentinelWindow(QMainWindow):
         self.check_button.clicked.connect(self.run_setup_checks)
         self.check_process.finished.connect(self.setup_checks_finished)
         self.check_process.errorOccurred.connect(self.setup_checks_error)
-        self.stats_process.finished.connect(self.capture_stats_finished)
-        self.stats_process.errorOccurred.connect(self.capture_stats_error)
 
     def set_advanced_details_visible(self, visible: bool) -> None:
         self.device_table.setColumnHidden(2, not visible)
@@ -868,12 +1042,20 @@ class RviSentinelWindow(QMainWindow):
             f"{name}: {'PASS' if passed else 'FAIL'}"
             for name, passed in self.setup_check_results
         )
-        outcome = "no traffic observed" if self.capture_no_traffic else (
-            "capture completed" if self.completed_capture_path is not None else "not completed"
+        receipt = self.capture_receipt if self.capture_receipt_error is None else None
+        outcome = receipt.capture_outcome if receipt is not None else "unverified"
+        validation = receipt.validation_status if receipt is not None else "unverified"
+        process_stop = (
+            "verified stopped" if receipt is not None and receipt.cleanup.recording_process_stopped is True else
+            "failed to stop" if receipt is not None and receipt.cleanup.recording_process_stopped is False else "unverified"
         )
+        interface = receipt.cleanup.interface_status if receipt is not None else "unverified"
+        failure_codes = ", ".join(f"{failure.stage}/{failure.code}" for failure in receipt.failures) if receipt is not None else "unavailable"
         text = (
             f"RVI-Sentinel diagnostics\nHost: {platform.system()}\n"
-            f"Capture outcome: {outcome}\nSetup checks:\n{checks or 'not run'}\n"
+            f"Recording outcome: {outcome}\nArtifact validation: {validation}\n"
+            f"Recording process: {process_stop}\nInterface cleanup: {interface}\n"
+            f"Failure codes: {failure_codes or 'none'}\nSetup checks:\n{checks or 'not run'}\n"
             "No device identifiers, packet contents, or private paths are included."
         )
         QApplication.clipboard().setText(text)
@@ -929,6 +1111,8 @@ class RviSentinelWindow(QMainWindow):
         self.check_status.setText(f"Could not run setup checks: {self.check_process.errorString()}")
 
     def refresh_devices(self) -> None:
+        if self.closing_requested:
+            return
         if self.device_process.state() != QProcess.ProcessState.NotRunning:
             return
         self.refresh_devices_button.setEnabled(False)
@@ -974,8 +1158,9 @@ class RviSentinelWindow(QMainWindow):
         self.discovered_devices = devices
         populate_device_table(self.device_table, devices)
         connected_count = sum(1 for device in devices if device.connected)
-        if self.completed_capture_path is not None:
-            self.capture_status_label.setText("Capture complete. The saved file is ready below.")
+        self.new_capture_button.setEnabled(connected_count > 0)
+        if self.completed_capture_receipt is not None:
+            return
         elif connected_count:
             self.capture_status_label.setText(
                 f"Ready: {connected_count} connected iOS device(s) available for capture."
@@ -1019,19 +1204,23 @@ class RviSentinelWindow(QMainWindow):
         self.active_capture_request = request
         self.last_capture_request = request
         self.completed_capture_path = None
+        self.completed_capture_receipt = None
+        self.capture_receipt = None
+        self.capture_receipt_error = None
+        self.capture_request_id = uuid.uuid4().hex
         self.completion_group.setVisible(False)
         self.retry_traffic_button.setVisible(False)
         self.capture_no_traffic = False
-        self.capture_started_at = None
-        self.capture_actual_seconds = None
         self.capture_elapsed_seconds = 0
         self.capture_countdown_started = False
         self.capture_event_buffer = ""
         self.capture_error_buffer = ""
         self.capture_cancel_requested = False
+        self.capture_cancel_timer.stop()
         self.capture_timer.stop()
         self.capture_console.clear()
-        exact_command = shlex.join([sys.executable, *arguments])
+        session_arguments = [*arguments, "--request-id", self.capture_request_id]
+        exact_command = shlex.join([sys.executable, *session_arguments])
         self.capture_console.append(f"$ {exact_command}\n")
         self.capture_status_label.setText(
             f"Verifying {request.device.name} and preparing its capture interface…"
@@ -1046,7 +1235,7 @@ class RviSentinelWindow(QMainWindow):
         self.capture_process.setProcessEnvironment(environment)
         self.capture_process.setWorkingDirectory(str(ROOT))
         self.capture_process.setProgram(sys.executable)
-        self.capture_process.setArguments(arguments)
+        self.capture_process.setArguments(session_arguments)
         self.capture_process.start()
 
     def advance_capture_progress(self) -> None:
@@ -1084,10 +1273,30 @@ class RviSentinelWindow(QMainWindow):
         while "\n" in self.capture_event_buffer:
             line, self.capture_event_buffer = self.capture_event_buffer.split("\n", 1)
             self.handle_capture_event(line.strip())
+        if len(self.capture_event_buffer.encode("utf-8")) > MAXIMUM_RECEIPT_BYTES:
+            self.capture_receipt_error = "Capture helper event exceeds the supported size."
+            self.capture_event_buffer = ""
 
     def handle_capture_event(self, event: str) -> None:
         request = self.active_capture_request
         if request is None:
+            return
+        if event.startswith(CAPTURE_RECEIPT_EVENT):
+            if self.capture_receipt_error is not None:
+                return
+            try:
+                if self.capture_receipt is not None:
+                    raise CaptureReceiptError("Capture helper emitted more than one final receipt.")
+                request_id = self.capture_request_id
+                if request_id is None:
+                    raise CaptureReceiptError("The active capture has no request nonce.")
+                receipt = parse_capture_receipt(event[len(CAPTURE_RECEIPT_EVENT):])
+                validate_receipt_binding(receipt, request_id, request.output_path,
+                                         request.capture_format, request.duration_seconds)
+                self.capture_receipt = receipt
+            except CaptureReceiptError as error:
+                self.capture_receipt = None
+                self.capture_receipt_error = str(error)
             return
         if event == CAPTURE_AUTHORIZATION_EVENT:
             self.capture_status_label.setText(
@@ -1106,26 +1315,23 @@ class RviSentinelWindow(QMainWindow):
             return
         if event == CAPTURE_STARTED_EVENT and not self.capture_countdown_started:
             self.capture_countdown_started = True
-            self.capture_started_at = time.monotonic()
             self.capture_elapsed_seconds = 0
             self.capture_progress.setRange(0, request.duration_seconds)
             self.capture_progress.setValue(0)
             self.capture_progress.setFormat(f"0 / {request.duration_seconds} seconds")
             self.capture_status_label.setText(
-                f"Live packets verified. Capturing {request.device.name} for "
+                f"Recording started. Capturing {request.device.name} for "
                 f"{request.duration_seconds} seconds…"
             )
             self.capture_timer.start()
             return
         if event == CAPTURE_VALIDATED_EVENT:
             self.capture_timer.stop()
-            if self.capture_started_at is not None:
-                self.capture_actual_seconds = time.monotonic() - self.capture_started_at
             self.capture_progress.setRange(0, request.duration_seconds)
             self.capture_progress.setValue(request.duration_seconds)
-            self.capture_progress.setFormat("Capture validated")
+            self.capture_progress.setFormat("Awaiting final capture receipt")
             self.capture_status_label.setText(
-                "Capture file closed successfully and contains readable packets."
+                "Artifact validation reported. Waiting for the final cleanup outcome."
             )
             return
         if event == CAPTURE_NO_TRAFFIC_EVENT:
@@ -1147,98 +1353,129 @@ class RviSentinelWindow(QMainWindow):
     def cancel_capture(self) -> None:
         if self.capture_process.state() == QProcess.ProcessState.NotRunning:
             return
-        self.capture_status_label.setText("Cancelling capture and cleaning up its interface…")
+        self.capture_status_label.setText(
+            "Cancellation requested. Waiting for recording termination and interface cleanup evidence…"
+        )
         self.capture_console.append("\nCancellation requested by user.")
         self.capture_cancel_requested = True
         self.cancel_capture_button.setEnabled(False)
         self.capture_process.terminate()
-        QTimer.singleShot(15_000, self.force_kill_capture)
+        self.capture_cancel_timer.start(60_000)
 
     def force_kill_capture(self) -> None:
-        if self.capture_process.state() != QProcess.ProcessState.NotRunning:
+        if self.capture_cancel_requested and self.capture_process.state() != QProcess.ProcessState.NotRunning:
             self.capture_console.append(
-                "Capture helper did not exit within 15 seconds; forcing it to stop."
+                "Capture helper did not exit within 60 seconds; forcing the helper to stop. "
+                "Recording-process and interface cleanup remain unverified without a final receipt."
             )
             self.capture_process.kill()
 
     def capture_finished(
-        self, exit_code: int, _exit_status: QProcess.ExitStatus
+        self, exit_code: int, exit_status: QProcess.ExitStatus
     ) -> None:
-        self.read_capture_output()
-        self.read_capture_error()
+        if self.capture_process.isOpen():
+            self.read_capture_output()
+            self.read_capture_error()
         if self.capture_event_buffer:
             self.handle_capture_event(self.capture_event_buffer.strip())
             self.capture_event_buffer = ""
         self.capture_timer.stop()
+        self.capture_cancel_timer.stop()
         request = self.active_capture_request
         cancellation_requested = self.capture_cancel_requested
+        receipt = self.capture_receipt
+        receipt_error = self.capture_receipt_error
         self.active_capture_request = None
+        self.capture_request_id = None
         self.capture_cancel_requested = False
         self.cancel_capture_button.setEnabled(False)
         self.refresh_devices_button.setEnabled(True)
         self.new_capture_button.setEnabled(
             any(device.connected for device in self.discovered_devices)
         )
+        self.capture_progress.setRange(0, 1)
+        self.capture_progress.setValue(0)
         if request is None:
             self.capture_status_label.setText(
-                f"Capture process exited with code {exit_code}, but no active request was recorded."
+                f"Capture helper exited with code {exit_code}, but no active request was recorded. "
+                "Recording termination and interface cleanup are unverified."
             )
             return
-        if exit_code != 0:
-            self.capture_progress.setRange(0, 1)
-            self.capture_progress.setValue(0)
-            if cancellation_requested:
-                self.capture_progress.setFormat("Capture cancelled")
-                self.capture_status_label.setText(
-                    "Capture cancelled. The RVI interface was removed and any partial local "
-                    "capture remains at its selected path."
-                )
-                QTimer.singleShot(0, self.refresh_devices)
-                return
-            if self.capture_no_traffic:
-                self.capture_progress.setFormat("No packets observed")
-                self.capture_status_label.setText(
-                    "No packets were observed during the five-second check. Open a webpage "
-                    "on the phone, then choose Retry Traffic Check. The device was not reported disconnected."
-                )
-                self.retry_traffic_button.setVisible(True)
-                return
-            self.capture_progress.setFormat("Capture failed")
-            backend_detail = self.capture_error_buffer.strip()
-            raw_detail = backend_detail or (
-                f"Capture failed with exit code {exit_code}, but the backend returned no "
-                "diagnostic output."
+        if receipt is None or receipt_error is not None:
+            self.capture_progress.setFormat("Capture outcome unverified")
+            detail = receipt_error or "The helper returned no valid final capture receipt."
+            prefix = "Cancellation was requested. " if cancellation_requested else ""
+            self.capture_status_label.setText(
+                prefix + detail + " Recording termination, saved-artifact validity, and interface "
+                "cleanup are unverified. Inspect owned resources before retrying."
             )
-            detail = redact_capture_detail(raw_detail, request)
-            self.capture_status_label.setText(detail)
-            self.show_error("Capture failed", detail)
-            QTimer.singleShot(0, self.refresh_devices)
-            return
-        if not request.output_path.is_file():
-            detail = f"Capture completed without creating the expected file: {request.output_path}"
-            self.capture_progress.setFormat("Capture file missing")
-            self.capture_status_label.setText(detail)
-            self.show_error("Capture file missing", detail)
+            self.capture_console.append("\n" + self.capture_status_label.text())
             return
 
-        self.capture_progress.setRange(0, request.duration_seconds)
-        self.capture_progress.setValue(request.duration_seconds)
-        self.capture_progress.setFormat("Capture complete")
-        self.capture_status_label.setText("Capture complete. The saved file is ready below.")
-        self.capture_console.append(f"\nReady to analyze: {request.output_path}")
-        self.capture_field.setText(str(request.output_path))
+        helper_completed_normally = exit_status == QProcess.ExitStatus.NormalExit
+        successful = receipt_is_success(receipt) and helper_completed_normally and exit_code == 0
+        process_text = (
+            "verified stopped" if receipt.cleanup.recording_process_stopped is True else
+            "failed to stop" if receipt.cleanup.recording_process_stopped is False else "unverified"
+        )
+        interface_text = {
+            "verified_complete": "verified complete",
+            "failed": "failed",
+            "unverified": "unverified",
+            "not_applicable": "not applicable",
+        }[receipt.cleanup.interface_status]
+        artifact_text = "verified readable" if receipt.artifact is not None else receipt.validation_status.replace("_", " ")
+        result_lines = [
+            f"Recording outcome: {receipt.capture_outcome}.",
+            f"Saved-artifact validation: {artifact_text}.",
+            f"Recording process: {process_text}. Interface cleanup: {interface_text}.",
+        ]
+        result_lines.extend(
+            f"{failure.stage.capitalize()} [{failure.code}]: {redact_capture_detail(failure.message, request)}"
+            for failure in receipt.failures
+        )
+        if not helper_completed_normally or (receipt_is_success(receipt) and exit_code != 0):
+            result_lines.append(
+                f"Helper communication ended with exit code {exit_code}; overall completion was not confirmed."
+            )
+        if cancellation_requested and receipt.capture_outcome == "completed":
+            result_lines.append("Cancellation arrived after recording completed; the final receipt reports completion.")
+        self.capture_progress.setValue(1 if successful else 0)
+        self.capture_progress.setFormat("Capture complete" if successful else "Review capture outcome")
+        self.capture_status_label.setText("\n".join(result_lines))
+        if self.capture_no_traffic:
+            self.retry_traffic_button.setVisible(True)
+        artifact = receipt.artifact
+        if artifact is None:
+            return
+
+        self.completed_capture_receipt = receipt
         self.completed_capture_path = request.output_path
+        self.capture_field.setText(str(request.output_path))
         self.manual_baseline_selected = False
         self.baseline_field.setText(str(device_baseline_path(request.device)))
+        lifetime = (
+            format_duration(receipt.recording_lifetime_nanoseconds / 1_000_000_000)
+            if receipt.recording_lifetime_nanoseconds is not None else "Unavailable (not observed)"
+        )
         self.completion_summary.setText(
             f"Saved location: {request.output_path}\n"
-            f"File size: {format_bytes(request.output_path.stat().st_size)}\n"
-            "Packet count: Checking…\n"
-            f"Actual capture time: {format_duration(self.capture_actual_seconds)}"
+            f"Verified format: {artifact.capture_format.upper()}\n"
+            f"File size: {format_bytes(artifact.size_bytes)}\n"
+            f"Readable packet records: {artifact.packet_count:,}\n"
+            f"Records with positive captured data: {artifact.positive_packet_count:,}\n"
+            f"SHA-256: {artifact.sha256}\n"
+            f"Requested recording duration: {receipt.requested_duration_seconds} seconds\n"
+            f"Observed recording lifetime: {lifetime}\n"
+            f"Packet timestamp span: {artifact.packet_span_nanoseconds} nanoseconds\n"
+            f"First packet epoch: {artifact.first_packet_epoch}\n"
+            f"Last packet epoch: {artifact.last_packet_epoch}\n"
+            f"Recording outcome: {receipt.capture_outcome}\n"
+            f"Recording process: {process_text}\nInterface cleanup: {interface_text}\n"
+            "The verified saved artifact is available for passive inspection."
         )
         self.completion_group.setVisible(True)
-        self.read_capture_stats(request.output_path)
-        QTimer.singleShot(0, self.refresh_devices)
+        self.capture_console.append("\nVerified saved evidence is available for passive inspection.")
 
     def retry_traffic_check(self) -> None:
         request = self.last_capture_request
@@ -1252,66 +1489,45 @@ class RviSentinelWindow(QMainWindow):
             return
         self.start_capture(request, arguments)
 
-    def read_capture_stats(self, path: Path) -> None:
-        if self.stats_process.state() != QProcess.ProcessState.NotRunning:
-            self.show_error("Capture statistics busy", "A previous capture statistics check is still running.")
-            return
-        self.stats_process.setWorkingDirectory(str(ROOT))
-        self.stats_process.setProgram(sys.executable)
-        self.stats_process.setArguments([str(CAPTURE_STATS), str(path)])
-        self.stats_process.start()
-
-    def capture_stats_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
-        path = self.completed_capture_path
-        if path is None:
-            return
-        output = bytes(self.stats_process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        error = bytes(self.stats_process.readAllStandardError()).decode("utf-8", errors="replace")
-        if exit_code != 0:
-            packet_text = f"Unavailable ({error.strip() or 'tshark failed'})"
-        else:
-            try:
-                payload: object = json.loads(output)
-                if not isinstance(payload, dict) or not isinstance(payload.get("packet_count"), int):
-                    raise ValueError("Packet count missing from statistics output.")
-                packet_text = f"{payload['packet_count']:,}"
-                duration_value = payload.get("duration_seconds")
-                if isinstance(duration_value, (int, float)):
-                    self.capture_actual_seconds = float(duration_value)
-            except (json.JSONDecodeError, ValueError) as parse_error:
-                packet_text = f"Unavailable ({parse_error})"
-        self.completion_summary.setText(
-            f"Saved location: {path}\nFile size: {format_bytes(path.stat().st_size)}\n"
-            f"Packet count: {packet_text}\n"
-            f"Actual capture time: {format_duration(self.capture_actual_seconds)}"
-        )
-
-    def capture_stats_error(self, error: QProcess.ProcessError) -> None:
-        if error == QProcess.ProcessError.Crashed:
-            return
-        self.capture_status_label.setText(
-            f"Capture saved, but packet counting could not start: {self.stats_process.errorString()}"
-        )
-
     def analyze_completed_capture(self) -> None:
-        if self.completed_capture_path is None:
-            self.show_error("No completed capture", "Complete a capture before analyzing it.")
+        if self.completed_capture_path is None or self.completed_capture_receipt is None:
+            self.show_error("No verified saved capture", "Wait for a valid final capture receipt before analyzing it.")
             return
+        self.capture_field.setText(str(self.completed_capture_path))
         self.workspace_tabs.setCurrentIndex(1)
         self.start_analysis()
 
     def open_capture_location(self) -> None:
         if self.completed_capture_path is None:
-            self.show_error("No completed capture", "Complete a capture first.")
+            self.show_error("No verified saved capture", "Wait for a verified saved artifact before opening its location.")
             return
         directory = self.completed_capture_path.parent
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
             self.show_error("Could not open file location", str(directory))
 
     def capture_process_error(self, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.Crashed:
+            return
         detail = f"Could not run the capture helper: {error.name}"
         self.capture_console.append(detail)
-        self.capture_status_label.setText(detail)
+        if error == QProcess.ProcessError.FailedToStart:
+            self.capture_receipt = None
+            self.capture_receipt_error = detail
+            self.active_capture_request = None
+            self.capture_request_id = None
+            self.capture_cancel_requested = False
+            self.capture_cancel_timer.stop()
+            self.capture_timer.stop()
+            self.cancel_capture_button.setEnabled(False)
+            self.refresh_devices_button.setEnabled(True)
+            self.new_capture_button.setEnabled(any(device.connected for device in self.discovered_devices))
+            self.capture_progress.setRange(0, 1)
+            self.capture_progress.setValue(0)
+            self.capture_progress.setFormat("Capture outcome unverified")
+        self.capture_status_label.setText(
+            detail + ". No final capture receipt is available; saved-artifact validation "
+            "and recording/interface cleanup are unverified."
+        )
 
     def install_capture_support(self) -> None:
         if platform.system() not in {"Linux", "Windows"}:
@@ -1377,7 +1593,17 @@ class RviSentinelWindow(QMainWindow):
             "Packet captures (*.pcap *.pcapng *.cap);;All files (*)",
         )
         if selected:
-            self.capture_field.setText(selected)
+            self.select_imported_capture(Path(selected))
+
+    def select_imported_capture(self, path: Path) -> None:
+        """An explicit import establishes new evidence independently of a stale receipt."""
+        imported_path = path.expanduser().resolve()
+        receipt = self.completed_capture_receipt
+        if receipt is not None and imported_path == receipt.output_path:
+            self.completed_capture_receipt = None
+            self.completed_capture_path = None
+            self.completion_group.setVisible(False)
+        self.capture_field.setText(str(imported_path))
 
     def choose_baseline(self) -> None:
         selected, _filter = QFileDialog.getSaveFileName(
@@ -1447,10 +1673,15 @@ class RviSentinelWindow(QMainWindow):
     def refresh_command_preview(self) -> None:
         try:
             request = self.current_request()
+            if self.preview_request is not None and request != self.preview_request:
+                self.invalidate_reviewed_preview()
             self.current_geoip_database()
-            arguments = analyzer_arguments(request, ANALYZER_PREVIEW)
+            arguments, _digest = passive_analysis_arguments(
+                request, self.completed_capture_receipt, ANALYZER_PREVIEW, CAPTURE_ANALYZER
+            )
             command = shlex.join([sys.executable, *arguments])
         except RequestValidationError:
+            self.invalidate_reviewed_preview()
             command = (
                 "Select a valid capture and optional GeoIP database to preview the analyzer command."
             )
@@ -1458,19 +1689,31 @@ class RviSentinelWindow(QMainWindow):
         self.command_field.setCursorPosition(0)
         self.command_field.setToolTip(command)
 
+    def invalidate_reviewed_preview(self) -> None:
+        """A reviewed digest authorizes only the current validated preview request."""
+        self.preview_request = None
+        self.preview_sha256 = None
+        self.add_to_baseline_button.setEnabled(False)
+
     def start_analysis(self) -> None:
+        if self.report_loading:
+            return
         if self.process.state() != QProcess.ProcessState.NotRunning:
             return
         try:
             request = self.current_request()
-            arguments = analyzer_arguments(request, ANALYZER_PREVIEW)
+            arguments, expected_capture_sha256 = passive_analysis_arguments(
+                request, self.completed_capture_receipt, ANALYZER_PREVIEW, CAPTURE_ANALYZER
+            )
         except RequestValidationError as error:
             self.show_error("Invalid analysis configuration", str(error))
             return
 
         self.active_request = request
+        self.active_analysis_capture_sha256 = expected_capture_sha256
         self.preview_request = None
         self.updating_baseline = False
+        self.analysis_cancel_requested = False
         self.add_to_baseline_button.setEnabled(False)
         self.cancel_endpoint_enrichment()
         self.clear_results()
@@ -1482,6 +1725,7 @@ class RviSentinelWindow(QMainWindow):
         self.console.append(f"$ {exact_command}\n")
         self.status_label.setText(f"Analyzing {request.capture_path.name}…")
         self.analyze_button.setEnabled(False)
+        self.cancel_analysis_button.setEnabled(True)
 
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUNBUFFERED", "1")
@@ -1491,16 +1735,47 @@ class RviSentinelWindow(QMainWindow):
         self.process.setArguments(arguments)
         self.process.start()
 
+    def cancel_analysis(self) -> None:
+        if self.report_loading:
+            self.cancel_report_loading()
+            self.invalidate_reviewed_preview()
+            self.analyze_button.setEnabled(True)
+            self.cancel_analysis_button.setEnabled(False)
+            self.status_label.setText("Report loading cancelled. Completed local exports remain available for a later review.")
+            return
+        if self.process.state() == QProcess.ProcessState.NotRunning or self.updating_baseline:
+            return
+        self.analysis_cancel_requested = True
+        self.cancel_analysis_button.setEnabled(False)
+        self.status_label.setText("Cancelling analysis; the selected baseline remains unchanged.")
+        self.process.terminate()
+        # Decoder cleanup permits 1 s terminate, 2 s kill wait and 2 s per pipe reader.
+        self.analysis_cancel_timer.start(8_000)
+
+    def force_stop_analysis(self) -> None:
+        if self.analysis_cancel_requested and self.process.state() != QProcess.ProcessState.NotRunning:
+            self.process.kill()
+
     def add_findings_to_baseline(self) -> None:
         if self.process.state() != QProcess.ProcessState.NotRunning:
+            return
+        if self.enrichment_process.state() != QProcess.ProcessState.NotRunning:
+            self.show_error("Endpoint lookup active", "Finish or cancel the current endpoint lookup before adding reviewed findings.")
             return
         try:
             request = self.current_request()
             if request != self.preview_request:
+                self.invalidate_reviewed_preview()
                 raise RequestValidationError(
                     "Capture, baseline, or analysis settings changed. Run read-only analysis again first."
                 )
-            arguments = analyzer_arguments(request, ANALYZER)
+            expected_sha256 = self.preview_sha256
+            if expected_sha256 is None:
+                raise RequestValidationError(
+                    "This preview has no verified capture digest. Run read-only analysis again before updating the baseline."
+                )
+            arguments = analyzer_arguments(request, REVIEWED_ANALYZER)
+            arguments.extend(("--expected-sha256", expected_sha256))
         except RequestValidationError as error:
             self.show_error("Cannot update baseline", str(error))
             return
@@ -1516,6 +1791,8 @@ class RviSentinelWindow(QMainWindow):
             return
         self.active_request = request
         self.updating_baseline = True
+        self.analysis_cancel_requested = False
+        self.cancel_analysis_button.setEnabled(False)
         self.add_to_baseline_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
         self.console.append("\nAdding findings to the selected baseline…\n")
@@ -1538,18 +1815,34 @@ class RviSentinelWindow(QMainWindow):
             self.console.insertPlainText(output)
 
     def analysis_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
-        self.read_standard_output()
-        self.read_standard_error()
+        self.analysis_cancel_timer.stop()
+        if self.process.isOpen():
+            self.read_standard_output()
+            self.read_standard_error()
         self.analyze_button.setEnabled(True)
+        self.cancel_analysis_button.setEnabled(False)
         updating_baseline = self.updating_baseline
         self.updating_baseline = False
+        cancelled = self.analysis_cancel_requested
+        self.analysis_cancel_requested = False
 
         request = self.active_request
+        expected_capture_sha256 = self.active_analysis_capture_sha256
+        self.active_analysis_capture_sha256 = None
         self.active_request = None
         if request is None:
             self.show_error("Analyzer state error", "No active analysis request was recorded.")
             return
+        if cancelled:
+            self.invalidate_reviewed_preview()
+            self.status_label.setText(
+                "Analysis cancelled. The selected baseline was not changed; "
+                "any completed local exports may remain in the export folder."
+            )
+            return
         if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
+            if updating_baseline:
+                self.invalidate_reviewed_preview()
             self.status_label.setText(f"Analysis failed with exit code {exit_code}.")
             self.show_error(
                 "Analysis failed",
@@ -1557,37 +1850,427 @@ class RviSentinelWindow(QMainWindow):
             )
             return
 
-        report_path = report_path_for(request)
-        try:
-            report = load_report(report_path)
-        except ReportValidationError as error:
-            self.status_label.setText("Analysis completed, but the report could not be loaded.")
-            self.show_error("Report validation failed", str(error))
-            return
+        self.begin_report_load(request, report_path_for(request), expected_capture_sha256, updating_baseline)
 
-        self.active_report_path = report_path
-        if updating_baseline:
-            self.preview_request = None
-            self.add_to_baseline_button.setEnabled(False)
+    def begin_report_load(self, request: AnalysisRequest, report_path: Path,
+                          expected_capture_sha256: str | None, updating_baseline: bool) -> None:
+        """Queue only the newest generation while an earlier owned load cancels."""
+        if self.closing_requested:
+            return
+        self.report_generation += 1
+        context = ReportLoadContext(self.report_generation, request, report_path,
+                                    expected_capture_sha256, updating_baseline)
+        self.report_load_context = context
+        self.report_loading = True
+        self.analyze_button.setEnabled(False)
+        self.cancel_analysis_button.setEnabled(not updating_baseline)
+        self.add_to_baseline_button.setEnabled(False)
+        self.status_label.setText("Loading and validating saved report evidence…")
+        if self.report_worker is not None:
+            self.report_worker.cancel()
+            self.pending_report_load = context
         else:
-            self.preview_request = request
-            self.add_to_baseline_button.setEnabled(True)
+            self.start_report_worker(context)
+
+    def start_report_worker(self, context: ReportLoadContext) -> None:
+        worker = ReportLoadWorker(self, context.generation, context.path)
+        self.report_worker = worker
+        worker.report_ready.connect(self.report_loaded, Qt.ConnectionType.QueuedConnection)
+        worker.report_failed.connect(self.report_loading_failed, Qt.ConnectionType.QueuedConnection)
+        worker.report_cancelled.connect(self.report_loading_cancelled, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self.report_worker_finished, Qt.ConnectionType.QueuedConnection)
+        worker.start()
+
+    @Slot(int, AnalysisReport)
+    def report_loaded(self, generation: int, report: AnalysisReport) -> None:
+        context = self.report_load_context
+        if context is None or context.generation != generation or self.closing_requested:
+            return
+        if not isinstance(report, AnalysisReport):
+            self.report_loading_failed(generation, "The report worker returned an invalid typed result.")
+            return
+        request = context.request
+        report_path = context.path
+        updating_baseline = context.baseline_update
+        expected_capture_sha256 = context.expected_sha256
+        if expected_capture_sha256 is not None and (
+            report.evidence is None or report.evidence.sha256 != expected_capture_sha256
+        ):
+            self.invalidate_reviewed_preview()
+            self.report_loading_failed(generation,
+                "The saved capture changed after its receipt was verified. This report cannot be attributed to the guided capture; select and review the changed file as a separate imported capture.")
+            return
+        self.report_loading = False
+        self.report_load_context = None
+        self.analyze_button.setEnabled(True)
+        self.cancel_analysis_button.setEnabled(False)
+        self.active_report_path = report_path
+        self.baseline_updated_for_report = updating_baseline
+        if updating_baseline:
+            self.invalidate_reviewed_preview()
+        else:
+            try:
+                current_request = self.current_request()
+            except RequestValidationError:
+                self.invalidate_reviewed_preview()
+            else:
+                if request == current_request and report.evidence is not None:
+                    self.preview_request = request
+                    self.preview_sha256 = report.evidence.sha256
+                    self.add_to_baseline_button.setEnabled(True)
+                else:
+                    self.invalidate_reviewed_preview()
         self.populate_report(report)
         self.start_endpoint_enrichment(report.endpoints)
         self.open_exports_button.setEnabled(True)
         if updating_baseline:
             self.status_label.setText(f"Findings added to baseline: {request.baseline_path}")
         else:
-            self.status_label.setText("Read-only analysis complete. Baseline unchanged; review findings before adding them.")
+            detail = (
+                "Read-only analysis complete. Baseline unchanged; review findings before adding them."
+                if self.preview_sha256 is not None else
+                "Read-only analysis complete. Run a verified preview for the current settings before adding findings."
+            )
+            self.status_label.setText(detail)
+
+        self.report_load_finished.emit()
+
+    @Slot(int, str)
+    def report_loading_failed(self, generation: int, detail: str) -> None:
+        context = self.report_load_context
+        if context is None or context.generation != generation:
+            return
+        self.report_loading = False
+        self.report_load_context = None
+        self.analyze_button.setEnabled(True)
+        self.cancel_analysis_button.setEnabled(False)
+        self.invalidate_reviewed_preview()
+        self.status_label.setText("Analysis completed, but the report could not be loaded.")
+        self.show_error("Report validation failed", detail)
+        self.report_load_finished.emit()
+
+    @Slot(int)
+    def report_loading_cancelled(self, generation: int) -> None:
+        context = self.report_load_context
+        if context is not None and context.generation == generation:
+            self.report_loading = False
+            self.report_load_context = None
+            self.analyze_button.setEnabled(True)
+            self.cancel_analysis_button.setEnabled(False)
+            self.status_label.setText("Report loading cancelled; no partial packet evidence was displayed.")
+            self.report_load_finished.emit()
+
+    @Slot()
+    def report_worker_finished(self) -> None:
+        worker = self.report_worker
+        if worker is None:
+            return
+        if self.report_load_context is not None and self.report_load_context.generation == worker.generation:
+            self.report_loading_failed(worker.generation, "The report worker exited without a completed result. Run analysis again before reviewing it.")
+        self.report_worker = None
+        worker.deleteLater()
+        pending = self.pending_report_load
+        self.pending_report_load = None
+        if pending is not None and self.report_load_context == pending and not self.closing_requested:
+            self.start_report_worker(pending)
+        if self.closing_requested:
+            self.continue_close()
+
+    def cancel_report_loading(self) -> None:
+        self.report_generation += 1
+        self.report_load_context = None
+        self.pending_report_load = None
+        self.report_loading = False
+        if self.report_worker is not None:
+            self.report_worker.cancel()
+        self.report_load_finished.emit()
+
+    @Slot()
+    def continue_close(self) -> None:
+        if self.closing_requested:
+            self.close()
+            if self.quit_requested and not self.packet_timeline.is_busy and not self.session_timeline.is_busy and not self.dns_evidence_view.is_busy and (
+                self.report_worker is None or not self.report_worker.isRunning()
+            ):
+                QApplication.quit()
 
     def process_error(self, error: QProcess.ProcessError) -> None:
-        if error == QProcess.ProcessError.Crashed:
+        if error == QProcess.ProcessError.Crashed or self.analysis_cancel_requested:
             return
+        self.analysis_cancel_timer.stop()
+        self.cancel_analysis_button.setEnabled(False)
         self.analyze_button.setEnabled(True)
         self.status_label.setText("The analyzer process could not be started.")
         self.show_error("Process error", self.process.errorString())
 
+    def clear_session_navigation(self) -> None:
+        self.dns_navigation_origin = None
+        self.dns_session_origin = None
+        self.packet_timeline.return_dns_button.setEnabled(False)
+        self.session_timeline.return_dns_button.setEnabled(False)
+        self.dns_evidence_view.return_session_button.setEnabled(False)
+        self.session_navigation_origin = None
+        self.packet_navigation_origin = None
+        self.packet_session_jump_origin = None
+        self.packet_timeline.back_to_sessions_button.setEnabled(False)
+        self.packet_timeline.restore_timeline_button.setEnabled(False)
+        self.session_timeline.return_packets_button.setEnabled(False)
+
+    def remember_session_navigation(self) -> None:
+        if self.packet_navigation_origin is None:
+            self.packet_navigation_origin = self.packet_timeline.capture_navigation()
+            self.session_navigation_origin = self.session_timeline.capture_navigation()
+        self.packet_timeline.back_to_sessions_button.setEnabled(self.session_navigation_origin is not None)
+        self.packet_timeline.restore_timeline_button.setEnabled(self.packet_navigation_origin is not None)
+        self.session_timeline.return_packets_button.setEnabled(self.packet_navigation_origin is not None)
+
+    @Slot(object)
+    def show_session_dns_evidence(self, value: object) -> None:
+        if self.closing_requested or not isinstance(value, SessionIdentity):
+            return
+        if not self.dns_evidence_view.filter_for_session(value):
+            self.session_timeline.status_label.setText("Passive DNS evidence is unavailable for this session in the current report.")
+            return
+        self.dns_session_origin = self.session_timeline.capture_navigation()
+        self.dns_evidence_view.return_session_button.setEnabled(self.dns_session_origin is not None)
+        self.results_tabs.setCurrentWidget(self.dns_evidence_view)
+
+    def remember_dns_navigation(self) -> None:
+        self.dns_navigation_origin = self.dns_evidence_view.capture_navigation()
+        self.packet_timeline.return_dns_button.setEnabled(self.dns_navigation_origin is not None)
+        self.session_timeline.return_dns_button.setEnabled(self.dns_navigation_origin is not None)
+
+    def open_dns_packet_scope(self, capture_sha256: str, frames: tuple[int, ...], label: str) -> None:
+        if self.closing_requested:
+            return
+        self.remember_dns_navigation()
+        self.remember_session_navigation()
+        try:
+            self.packet_timeline.set_packet_scope(capture_sha256, frames, label)
+            if frames:
+                self.packet_timeline.select_packet(PacketIdentity(capture_sha256, frames[0]))
+        except PacketQueryValidationError as error:
+            self.dns_evidence_view.status_label.setText(f"DNS packet navigation failed: {error}")
+            return
+        self.results_tabs.setCurrentWidget(self.packet_timeline)
+
+    @Slot(object)
+    def show_dns_packet(self, value: object) -> None:
+        index = self.dns_evidence_view.dns_index
+        if not isinstance(value, PacketIdentity) or index is None:
+            return
+        try:
+            available = bool(dns_messages_for_frame(index, value))
+        except PacketQueryValidationError as error:
+            self.dns_evidence_view.status_label.setText(f"DNS frame navigation failed: {error}")
+            return
+        if not available:
+            self.dns_evidence_view.status_label.setText("The requested DNS evidence frame is unavailable in this capture.")
+            return
+        self.open_dns_packet_scope(value.capture_sha256, (value.frame_number,), f"Structured DNS evidence decoded in frame {value.frame_number}")
+
+    @Slot(object)
+    def show_dns_matched_packets(self, value: object) -> None:
+        index = self.dns_evidence_view.dns_index
+        if not isinstance(value, DnsAssociationIdentity) or index is None:
+            return
+        try:
+            association = dns_association_for_identity(index, value)
+        except DnsSessionValidationError as error:
+            self.dns_evidence_view.status_label.setText(f"DNS candidate navigation failed: {error}")
+            return
+        if association is None:
+            self.dns_evidence_view.status_label.setText("The DNS candidate no longer belongs to the current capture.")
+            return
+        self.open_dns_packet_scope(value.capture_sha256, association.matching_frames,
+            f"Passive DNS candidate: {len(association.matching_frames)} scoped member frames inside the answer TTL window")
+
+    @Slot(str, object)
+    def show_observed_dns_packets(self, capture_sha256: str, value: object) -> None:
+        index = self.dns_evidence_view.dns_index
+        if index is None or index.capture_sha256 != capture_sha256 or type(value) is not tuple or value != observed_dns_frames(index):
+            self.dns_evidence_view.status_label.setText("DNS observation navigation does not match this report's complete DNS frame evidence.")
+            return
+        self.open_dns_packet_scope(capture_sha256, value, f"Structured DNS observations: {len(value)} original decoder frames, including unassociated messages")
+
+    @Slot(object)
+    def show_dns_session(self, value: object) -> None:
+        if self.closing_requested or not isinstance(value, SessionIdentity):
+            return
+        self.remember_dns_navigation()
+        if not self.session_timeline.select_session(value):
+            self.dns_evidence_view.status_label.setText("The candidate session is unavailable in the current report.")
+            return
+        self.results_tabs.setCurrentWidget(self.session_timeline)
+
+    @Slot()
+    def return_to_dns_evidence(self) -> None:
+        navigation = self.dns_navigation_origin
+        if self.closing_requested or navigation is None:
+            return
+        if not self.dns_evidence_view.restore_navigation(navigation):
+            self.clear_session_navigation()
+            self.dns_evidence_view.status_label.setText("The previous DNS view belongs to an earlier report and cannot be restored.")
+            return
+        self.results_tabs.setCurrentWidget(self.dns_evidence_view)
+
+    @Slot()
+    def return_from_dns_to_session(self) -> None:
+        navigation = self.dns_session_origin
+        if self.closing_requested or navigation is None:
+            return
+        if not self.session_timeline.restore_navigation(navigation):
+            self.clear_session_navigation()
+            self.dns_evidence_view.status_label.setText("The original session view belongs to an earlier report and cannot be restored.")
+            return
+        self.results_tabs.setCurrentWidget(self.session_timeline)
+
+    @Slot(object)
+    def show_session_members(self, value: object) -> None:
+        index = self.session_timeline.session_index
+        if not isinstance(value, SessionIdentity) or index is None:
+            self.packet_timeline.status_label.setText("The selected session is not available in the current report.")
+            return
+        try:
+            session = session_for_identity(index, value)
+            if session is None:
+                raise SessionValidationError("The session belongs to another capture or is no longer available.")
+            frames = frames_for_session(index, value)
+            self.remember_session_navigation()
+            self.packet_timeline.set_packet_scope(value.capture_sha256, frames,
+                f"Session {session.scope.transport.upper()} stream {session.scope.stream}: {session.packet_count} scoped member packets")
+            self.packet_timeline.back_to_sessions_button.setEnabled(self.session_navigation_origin is not None)
+            self.packet_timeline.restore_timeline_button.setEnabled(self.packet_navigation_origin is not None)
+            if self.packet_timeline.selected_identity is None and frames:
+                self.packet_timeline.select_packet(PacketIdentity(value.capture_sha256, frames[0]))
+        except (SessionValidationError, PacketQueryValidationError) as error:
+            self.packet_timeline.status_label.setText(f"Session navigation failed: {error}")
+            return
+        self.results_tabs.setCurrentWidget(self.packet_timeline)
+
+    @Slot(str, object)
+    def show_ungrouped_packets(self, capture_sha256: str, value: object) -> None:
+        index = self.session_timeline.session_index
+        if index is None or index.capture_sha256 != capture_sha256 or not isinstance(value, tuple) or any(type(frame) is not int for frame in value):
+            self.packet_timeline.status_label.setText("Ungrouped packet navigation belongs to an unavailable capture.")
+            return
+        expected = tuple(packet.frame_number for packet in index.ungrouped)
+        if set(value) != set(expected) or len(value) != len(expected):
+            self.packet_timeline.status_label.setText("Ungrouped packet navigation does not match the complete ungrouped evidence.")
+            return
+        self.remember_session_navigation()
+        try:
+            self.packet_timeline.set_packet_scope(capture_sha256, value, f"Ungrouped evidence: {len(value)} packets with explicit correlation exclusions")
+            if value:
+                self.packet_timeline.select_packet(PacketIdentity(capture_sha256, value[0]))
+        except PacketQueryValidationError as error:
+            self.packet_timeline.status_label.setText(f"Ungrouped packet navigation failed: {error}")
+            return
+        self.results_tabs.setCurrentWidget(self.packet_timeline)
+
+    @Slot()
+    def refresh_packet_session_context(self) -> None:
+        index = self.session_timeline.dns_index
+        if index is not None:
+            self.dns_evidence_view.set_index(index)
+        self.update_packet_session_context(self.packet_timeline.selected_identity)
+
+    def dns_packet_context(self, identity: PacketIdentity) -> str:
+        index = self.session_timeline.dns_index
+        if index is None or index.capture_sha256 != identity.capture_sha256:
+            return " Structured passive DNS evidence is unavailable for this report."
+        messages = dns_messages_for_frame(index, identity)
+        if not messages:
+            return " Passive DNS associations cover only their explicitly referenced session frames; inspect DNS evidence for candidates."
+        reasons = sorted({item.reason for item in dns_diagnostics_for_frame(index, identity)})
+        response_codes = sorted({message.response_code for message in messages if message.is_response})
+        response_context = f" DNS response code: {', '.join(str(code) for code in response_codes)}." if response_codes else ""
+        if len(response_codes) > 32:
+            response_context = f" {len(response_codes)} distinct DNS response codes; complete values remain in DNS evidence."
+        return f" Structured DNS messages decoded in this frame: {len(messages)}. Observation reasons: {', '.join(reasons) if reasons else 'eligible positive answer evidence'}.{response_context} DNS messages can be TCP reassemblies; frame references do not imply all message bytes originated in this frame."
+
+    @Slot(object)
+    def update_packet_session_context(self, value: object) -> None:
+        self.packet_timeline.owning_session_button.setEnabled(False)
+        if not isinstance(value, PacketIdentity):
+            self.packet_timeline.set_correlation_context("Select a packet to inspect its session membership or exclusion reasons.")
+            return
+        index = self.session_timeline.session_index
+        if index is None or index.capture_sha256 != value.capture_sha256:
+            self.packet_timeline.set_correlation_context("Session correlation is not available for this packet's current report.")
+            return
+        identity = session_for_packet(index, value)
+        if identity is not None:
+            session = session_for_identity(index, identity)
+            if session is not None:
+                self.packet_timeline.owning_session_button.setEnabled(True)
+                self.packet_timeline.set_correlation_context(
+                    f"Scoped {session.scope.transport.upper()} stream {session.scope.stream}; session scope SHA-256 {identity.scope_sha256}; {session.packet_count} member packets. Grouping does not establish connection lifetime or process ownership." + self.dns_packet_context(value))
+                return
+        ungrouped = ungrouped_for_packet(index, value)
+        if ungrouped is not None:
+            reasons = ", ".join(ungrouped.reasons)
+            self.packet_timeline.set_correlation_context(f"Ungrouped packet. Correlation exclusions: {reasons}. No session membership was inferred." + self.dns_packet_context(value))
+        else:
+            self.packet_timeline.set_correlation_context("This frame is not present in the current session index; membership is unavailable.")
+
+    @Slot()
+    def show_owning_session(self) -> None:
+        identity = self.packet_timeline.selected_identity
+        index = self.session_timeline.session_index
+        if identity is None or index is None:
+            return
+        session_identity = session_for_packet(index, identity)
+        if session_identity is None:
+            self.update_packet_session_context(identity)
+            return
+        self.remember_session_navigation()
+        self.packet_session_jump_origin = self.packet_timeline.capture_navigation()
+        if not self.session_timeline.select_session(session_identity):
+            self.packet_timeline.status_label.setText("The owning session is no longer available in the current report.")
+            return
+        self.results_tabs.setCurrentWidget(self.session_timeline)
+
+    @Slot()
+    def return_to_sessions(self) -> None:
+        navigation = self.session_navigation_origin
+        if navigation is None:
+            return
+        self.packet_session_jump_origin = self.packet_timeline.capture_navigation()
+        if not self.session_timeline.restore_navigation(navigation):
+            self.clear_session_navigation()
+            self.packet_timeline.status_label.setText("The original session view belongs to an earlier report and cannot be restored.")
+            return
+        self.results_tabs.setCurrentWidget(self.session_timeline)
+
+    @Slot()
+    def return_from_session_to_packets(self) -> None:
+        navigation = self.packet_session_jump_origin or self.packet_navigation_origin
+        if navigation is None:
+            return
+        if not self.packet_timeline.restore_navigation(navigation):
+            self.clear_session_navigation()
+            self.session_timeline.status_label.setText("The previous packet view belongs to an earlier report and cannot be restored.")
+            return
+        self.results_tabs.setCurrentWidget(self.packet_timeline)
+
+    @Slot()
+    def return_to_packet_context(self) -> None:
+        navigation = self.packet_navigation_origin
+        if navigation is None:
+            return
+        if not self.packet_timeline.restore_navigation(navigation):
+            self.clear_session_navigation()
+            self.session_timeline.status_label.setText("The original packet view belongs to an earlier report and cannot be restored.")
+            return
+        self.clear_session_navigation()
+        self.results_tabs.setCurrentWidget(self.packet_timeline)
+
     def populate_report(self, report: AnalysisReport) -> None:
+        self.clear_session_navigation()
+        self.dns_evidence_view.clear_index()
+        self.packet_timeline.set_report(report)
+        self.session_timeline.set_report(report)
         capture = report.capture
         summary = report.summary
         self.summary_labels["capture_path"].setText(capture.path)
@@ -1606,6 +2289,27 @@ class RviSentinelWindow(QMainWindow):
             format_observation_count(summary.unique_tls_sni, len(summary.new_tls_sni))
         )
         self.summary_labels["quic"].setText(f"{summary.quic_like_packets:,}")
+        evidence = report.evidence
+        if evidence is None:
+            self.summary_labels["capture_digest"].setText("Not recorded in this report")
+            self.summary_labels["capture_integrity"].setText("Legacy report; import evidence not recorded")
+            self.summary_labels["decoder_coverage"].setText("Not recorded in this report")
+            self.summary_labels["decoder_coverage"].setToolTip("")
+            self.summary_labels["packet_record_count"].setText("Not recorded in this report")
+        else:
+            self.summary_labels["capture_digest"].setText(evidence.sha256)
+            self.summary_labels["capture_integrity"].setText(
+                f"{evidence.integrity}; origin: {evidence.origin}. Digest verifies bytes, not origin."
+            )
+            self.summary_labels["decoder_coverage"].setText(
+                f"{evidence.tshark_version}; {evidence.supported_field_count} supported fields, "
+                f"{len(evidence.unsupported_fields)} optional fields unavailable"
+            )
+            self.summary_labels["decoder_coverage"].setToolTip(
+                "Unavailable optional fields: " + ", ".join(evidence.unsupported_fields)
+                if evidence.unsupported_fields else "All requested optional fields were available."
+            )
+            self.summary_labels["packet_record_count"].setText(f"{evidence.packet_record_count:,}")
 
         populate_ranked_table(self.domains_table, report.domains)
         populate_ranked_table(self.tls_table, report.tls_sni)
@@ -1615,12 +2319,16 @@ class RviSentinelWindow(QMainWindow):
         self.interpretation.setPlainText(build_findings_explanation(report))
 
     def start_endpoint_enrichment(self, endpoints: tuple[RankedFinding, ...]) -> None:
+        self.endpoint_findings = endpoints
+        self.endpoint_enrichment_result = None
         populate_endpoint_table(self.endpoints_table, endpoints)
+        self.resolve_ptr_button.setEnabled(False)
         if not endpoints:
             self.status_label.setText(self.completed_status("No endpoints to enrich."))
+            self.enrichment_status_label.setText("No endpoints to enrich. PTR not requested.")
             return
 
-        arguments = [str(ENDPOINT_ENRICHER)]
+        arguments = [str(LOCAL_ENDPOINT_ENRICHER)]
         try:
             geo_database = self.current_geoip_database()
         except RequestValidationError as error:
@@ -1632,13 +2340,51 @@ class RviSentinelWindow(QMainWindow):
             arguments.extend(("--geo-db", str(geo_database)))
         arguments.extend(finding.value for finding in endpoints)
 
+        self.active_enrichment_source = "local"
+        self.enrichment_status_label.setText("Reading local scope and GeoIP context. PTR not requested.")
+        self.status_label.setText(self.completed_status("Reading local endpoint context; PTR not requested."))
+        self.start_enrichment_process(arguments)
+
+    def resolve_current_ptr_names(self) -> None:
+        if (
+            not self.endpoint_findings
+            or self.active_report_path is None
+            or self.enrichment_process.state() != QProcess.ProcessState.NotRunning
+            or self.process.state() != QProcess.ProcessState.NotRunning
+        ):
+            return
+        arguments = [str(ENDPOINT_ENRICHER)]
+        try:
+            geo_database = self.current_geoip_database()
+        except RequestValidationError as error:
+            self.show_error("Invalid GeoIP configuration", str(error))
+            return
+        if geo_database is not None:
+            arguments.extend(("--geo-db", str(geo_database)))
+        arguments.extend(finding.value for finding in self.endpoint_findings)
+        self.active_enrichment_source = "ptr"
+        self.endpoints_table.setSortingEnabled(False)
+        for row in range(self.endpoints_table.rowCount()):
+            item = self.endpoints_table.item(row, 1)
+            if item is not None:
+                item.setText("Resolving current PTR…")
+                item.setToolTip("Explicit current resolver query; this is separate from captured DNS/SNI.")
+        self.enrichment_status_label.setText(
+            "Current PTR names requested from the configured DNS resolver. "
+            "Captured DNS/SNI, reports and baselines remain unchanged."
+        )
+        self.status_label.setText(self.completed_status("Resolving explicitly requested current PTR names."))
+        self.start_enrichment_process(arguments)
+
+    def start_enrichment_process(self, arguments: list[str]) -> None:
         self.enrichment_timed_out = False
+        self.enrichment_cancel_requested = False
+        self.resolve_ptr_button.setEnabled(False)
+        self.add_to_baseline_button.setEnabled(False)
+        self.cancel_enrichment_button.setEnabled(True)
         self.enrichment_process.setWorkingDirectory(str(ROOT))
         self.enrichment_process.setProgram(sys.executable)
         self.enrichment_process.setArguments(arguments)
-        self.status_label.setText(
-            "Analysis complete; resolving PTR hostnames and local GeoIP locations…"
-        )
         self.enrichment_process.start()
         self.enrichment_timer.start(30_000)
 
@@ -1646,8 +2392,11 @@ class RviSentinelWindow(QMainWindow):
         self, exit_code: int, exit_status: QProcess.ExitStatus
     ) -> None:
         self.enrichment_timer.stop()
-        if self.enrichment_timed_out:
-            self.endpoints_table.setSortingEnabled(True)
+        expected_source = self.active_enrichment_source
+        self.active_enrichment_source = None
+        self.update_enrichment_actions()
+        if self.enrichment_timed_out or self.enrichment_cancel_requested:
+            self.restore_completed_enrichment()
             return
 
         error_text = bytes(self.enrichment_process.readAllStandardError()).decode(
@@ -1656,18 +2405,22 @@ class RviSentinelWindow(QMainWindow):
         if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
             detail = error_text or f"Endpoint enrichment exited with code {exit_code}."
             self.console.append(f"\n{detail}\n")
-            self.endpoints_table.setSortingEnabled(True)
+            self.enrichment_status_label.setText("Endpoint enrichment failed; no new lookup evidence was added.")
+            self.restore_completed_enrichment()
             self.status_label.setText(self.completed_status("Endpoint enrichment failed."))
             self.show_error("Endpoint enrichment failed", detail)
             return
 
-        output = bytes(self.enrichment_process.readAllStandardOutput()).decode(
-            "utf-8", errors="strict"
-        )
         try:
-            enrichment = parse_enrichment_output(output)
+            output = bytes(self.enrichment_process.readAllStandardOutput()).decode(
+                "utf-8", errors="strict"
+            )
+            result = parse_enrichment_result_output(output)
+            if result.evidence_source != expected_source:
+                raise ValueError("Endpoint enrichment evidence source does not match the requested operation.")
         except (UnicodeDecodeError, ValueError) as error:
-            self.endpoints_table.setSortingEnabled(True)
+            self.enrichment_status_label.setText("Endpoint enrichment output was invalid; no new lookup evidence was added.")
+            self.restore_completed_enrichment()
             self.status_label.setText(
                 self.completed_status("Endpoint enrichment output was invalid.")
             )
@@ -1675,61 +2428,138 @@ class RviSentinelWindow(QMainWindow):
             return
 
         try:
-            apply_endpoint_enrichment(self.endpoints_table, enrichment)
+            apply_endpoint_enrichment(self.endpoints_table, result.endpoints)
         except ValueError as error:
-            self.endpoints_table.setSortingEnabled(True)
+            self.enrichment_status_label.setText("Endpoint enrichment did not match this report; no new lookup evidence was added.")
+            self.restore_completed_enrichment()
             self.status_label.setText(
                 self.completed_status("Endpoint enrichment did not match the report.")
             )
             self.show_error("Endpoint enrichment mismatch", str(error))
             return
+        self.endpoint_enrichment_result = result
+        source_description = (
+            "Local scope/GeoIP context; PTR not requested"
+            if result.evidence_source == "local" else "Current PTR from the configured DNS resolver"
+        )
+        self.enrichment_status_label.setText(
+            f"{source_description}. Requested: {result.requested_at.isoformat()}; "
+            f"completed: {result.completed_at.isoformat()}. "
+            "This context is separate from captured DNS/SNI and is not written to reports or baselines."
+        )
+        for row in range(self.endpoints_table.rowCount()):
+            item = self.endpoints_table.item(row, 1)
+            if item is not None:
+                item.setToolTip(
+                    f"{item.toolTip()}\nEvidence source: {source_description}\n"
+                    f"Requested: {result.requested_at.isoformat()}\nCompleted: {result.completed_at.isoformat()}"
+                )
         geo_status = (
             "Local GeoIP applied."
             if self.geoip_field.text().strip()
             else "GeoIP database not configured."
         )
+        operation_status = (
+            "Local endpoint enrichment complete. PTR not requested."
+            if result.evidence_source == "local" else "Current PTR resolution complete."
+        )
         self.status_label.setText(
-            self.completed_status(f"PTR resolution complete. {geo_status}")
+            self.completed_status(f"{operation_status} {geo_status}")
         )
 
+    def update_enrichment_actions(self) -> None:
+        lookup_running = self.enrichment_process.state() != QProcess.ProcessState.NotRunning
+        self.cancel_enrichment_button.setEnabled(lookup_running)
+        self.add_to_baseline_button.setEnabled(
+            not lookup_running
+            and self.preview_request is not None
+            and self.preview_sha256 is not None
+            and self.process.state() == QProcess.ProcessState.NotRunning
+        )
+        self.resolve_ptr_button.setEnabled(
+            bool(self.endpoint_findings)
+            and self.active_report_path is not None
+            and not lookup_running
+            and self.process.state() == QProcess.ProcessState.NotRunning
+        )
+
+    def restore_completed_enrichment(self) -> None:
+        if self.endpoint_enrichment_result is not None:
+            result = self.endpoint_enrichment_result
+            apply_endpoint_enrichment(self.endpoints_table, result.endpoints)
+            retained_note = (
+                f"Last completed evidence retained: {result.evidence_source}; "
+                f"requested: {result.requested_at.isoformat()}; completed: {result.completed_at.isoformat()}."
+            )
+            self.enrichment_status_label.setText(f"{self.enrichment_status_label.text()} {retained_note}")
+            for row in range(self.endpoints_table.rowCount()):
+                item = self.endpoints_table.item(row, 1)
+                if item is not None:
+                    item.setToolTip(f"{item.toolTip()}\n{retained_note}")
+        else:
+            for row in range(self.endpoints_table.rowCount()):
+                self.endpoints_table.setItem(row, 1, QTableWidgetItem("Not requested"))
+                self.endpoints_table.setItem(row, 3, QTableWidgetItem("Local enrichment not completed"))
+        self.endpoints_table.setSortingEnabled(True)
+
     def endpoint_enrichment_error(self, error: QProcess.ProcessError) -> None:
-        if error == QProcess.ProcessError.Crashed or self.enrichment_timed_out:
+        if error == QProcess.ProcessError.Crashed or self.enrichment_timed_out or self.enrichment_cancel_requested:
             return
         self.enrichment_timer.stop()
-        self.endpoints_table.setSortingEnabled(True)
+        self.active_enrichment_source = None
+        self.update_enrichment_actions()
+        self.restore_completed_enrichment()
         detail = self.enrichment_process.errorString()
         self.console.append(f"\nEndpoint enrichment process error: {detail}\n")
         self.status_label.setText(
             self.completed_status("Endpoint enrichment process could not start.")
         )
+        self.enrichment_status_label.setText("Endpoint enrichment process could not start; no new evidence was added.")
 
     def endpoint_enrichment_timeout(self) -> None:
         if self.enrichment_process.state() == QProcess.ProcessState.NotRunning:
             return
         self.enrichment_timed_out = True
+        self.cancel_enrichment_button.setEnabled(False)
         self.enrichment_process.kill()
         self.endpoints_table.setSortingEnabled(True)
-        detail = "Endpoint PTR resolution exceeded 30 seconds and was stopped."
+        detail = "Endpoint lookup exceeded 30 seconds and was stopped. No new lookup evidence was added."
         self.console.append(f"\n{detail}\n")
         self.status_label.setText(self.completed_status(detail))
+        self.enrichment_status_label.setText(detail)
 
     def cancel_endpoint_enrichment(self) -> None:
         self.enrichment_timer.stop()
         if self.enrichment_process.state() != QProcess.ProcessState.NotRunning:
-            self.enrichment_timed_out = True
+            self.enrichment_cancel_requested = True
+            self.cancel_enrichment_button.setEnabled(False)
             self.enrichment_process.kill()
+            detail = "Endpoint lookup cancelled. No new lookup evidence was added."
+            self.status_label.setText(self.completed_status(detail))
+            self.enrichment_status_label.setText(detail)
 
     def completed_status(self, detail: str) -> str:
         report = str(self.active_report_path) if self.active_report_path else "not available"
         baseline_state = (
-            "Baseline unchanged until you choose Add findings."
-            if self.preview_request is not None else "Selected baseline was updated."
+            "Selected baseline was updated."
+            if self.baseline_updated_for_report else "Selected baseline was not changed by this analysis."
         )
         return f"Analysis complete. {baseline_state} {detail} Report: {report}"
 
     def clear_results(self) -> None:
+        self.cancel_report_loading()
+        self.clear_session_navigation()
+        self.packet_timeline.clear_report()
+        self.session_timeline.clear_report()
+        self.dns_evidence_view.clear_index()
         self.cancel_endpoint_enrichment()
-        self.preview_request = None
+        self.invalidate_reviewed_preview()
+        self.baseline_updated_for_report = False
+        self.endpoint_findings = ()
+        self.endpoint_enrichment_result = None
+        self.resolve_ptr_button.setEnabled(False)
+        self.cancel_enrichment_button.setEnabled(False)
+        self.enrichment_status_label.setText("Local endpoint context appears after analysis; PTR is not requested.")
         self.add_to_baseline_button.setEnabled(False)
         for label in self.summary_labels.values():
             label.setText("—")
@@ -1778,13 +2608,24 @@ class RviSentinelWindow(QMainWindow):
         urls = event.mimeData().urls()
         if len(urls) != 1 or not urls[0].isLocalFile():
             return
-        self.capture_field.setText(urls[0].toLocalFile())
+        self.select_imported_capture(Path(urls[0].toLocalFile()))
         self.workspace_tabs.setCurrentIndex(1)
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.closing_requested = True
+        self.cancel_report_loading()
+        packet_stopped = self.packet_timeline.shutdown()
+        session_stopped = self.session_timeline.shutdown()
+        dns_stopped = self.dns_evidence_view.shutdown()
+        report_stopped = self.report_worker is None or not self.report_worker.isRunning()
+        if not packet_stopped or not session_stopped or not dns_stopped or not report_stopped:
+            event.ignore()
+            return
         self.enrichment_timer.stop()
+        self.analysis_cancel_timer.stop()
         self.capture_timer.stop()
+        self.capture_cancel_timer.stop()
         for process in (
             self.process,
             self.enrichment_process,
@@ -1792,14 +2633,36 @@ class RviSentinelWindow(QMainWindow):
             self.capture_process,
             self.setup_process,
             self.check_process,
-            self.stats_process,
         ):
             if process.state() != QProcess.ProcessState.NotRunning:
+                if process is self.capture_process:
+                    self.capture_cancel_requested = True
                 process.terminate()
-                if not process.waitForFinished(5_000):
+                cleanup_deadline = (
+                    60_000 if process is self.capture_process else
+                    8_000 if process is self.process else 5_000
+                )
+                if not process.waitForFinished(cleanup_deadline):
                     process.kill()
                     process.waitForFinished(1_000)
         super().closeEvent(event)
+
+
+class WindowQuitFilter(QObject):
+    """Route application quit through owned worker and process shutdown."""
+
+    def __init__(self, window: RviSentinelWindow) -> None:
+        super().__init__(window)
+        self.window = window
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is QApplication.instance() and event.type() == QEvent.Type.Quit:
+            self.window.quit_requested = True
+            self.window.close()
+            return self.window.packet_timeline.is_busy or self.window.session_timeline.is_busy or self.window.dns_evidence_view.is_busy or (
+                self.window.report_worker is not None and self.window.report_worker.isRunning()
+            )
+        return False
 
 
 def capture_backend_summary(host_system: str) -> str:
@@ -1998,7 +2861,8 @@ def populate_endpoint_table(
     table.setRowCount(len(findings))
     for row_index, finding in enumerate(findings):
         address_item = QTableWidgetItem(finding.value)
-        hostname_item = QTableWidgetItem("Resolving…")
+        hostname_item = QTableWidgetItem("Not requested")
+        hostname_item.setToolTip("Current PTR names require an explicit configured-resolver request.")
         scope_item = QTableWidgetItem(classify_address(finding.value))
         location_item = QTableWidgetItem("Local GeoIP lookup pending…")
         count_item = QTableWidgetItem(f"{finding.count:,}")
@@ -2026,6 +2890,9 @@ def apply_endpoint_enrichment(
             "Endpoint enrichment count does not match the endpoint report: "
             f"{len(enrichment)} enrichment rows for {len(row_by_address)} endpoints."
         )
+    if {finding.address for finding in enrichment} != set(row_by_address):
+        raise ValueError("Endpoint enrichment addresses do not match the endpoint report.")
+    table.setSortingEnabled(False)
     for finding in enrichment:
         row = row_by_address.get(finding.address)
         if row is None:
@@ -2097,9 +2964,10 @@ def build_findings_explanation(report: AnalysisReport) -> str:
         "NEW means newly observed relative to that baseline; it is not a malicious verdict. "
         "Investigate unexpected changes using timing, process, signing, ownership, and destination context.\n\n"
         "ENDPOINT NAMES AND LOCATIONS\n"
-        "The Endpoints tab adds PTR reverse-DNS names and address scope. PTR records are controlled "
-        "by network operators and may be missing, generic, stale, or shared. PTR lookup queries are "
-        "sent to the Mac's configured DNS resolver. Geolocation uses only the selected local MMDB "
+        "The Endpoints tab adds local address scope and optional local GeoIP context without resolver queries. "
+        "Choose Resolve current PTR names to explicitly query the configured DNS resolver. Current PTR names "
+        "are separate from captured DNS/SNI and are not written into reports or baselines. PTR records are "
+        "controlled by network operators and may be missing, generic, stale, or shared. Geolocation uses only the selected local MMDB "
         "file; public endpoint IPs are not sent to a geolocation web API. IP location is "
         "approximate and must not be interpreted as a precise device, person, or household location.\n\n"
         "PORTS\n"
@@ -2146,6 +3014,8 @@ def initial_capture_path(arguments: list[str]) -> str | None:
 
 
 def present_main_window(window: RviSentinelWindow) -> None:
+    if window.closing_requested:
+        return
     window.setWindowState(Qt.WindowState.WindowNoState)
     if window.width() < 900 or window.height() < 680:
         window.resize(1180, 820)
@@ -2179,6 +3049,8 @@ def main(arguments: list[str]) -> int:
     set_macos_application_icon(APP_ICON)
 
     window = RviSentinelWindow()
+    quit_filter = WindowQuitFilter(window)
+    application.installEventFilter(quit_filter)
     capture_path = initial_capture_path(arguments)
     if capture_path is not None:
         window.capture_field.setText(capture_path)

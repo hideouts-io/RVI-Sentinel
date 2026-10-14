@@ -211,7 +211,7 @@ The desktop GUI presents capture, analysis, and setup checks as separate workspa
 - Linux/Windows capture through the separately installed `gh2o/rvi_capture` backend;
 - pass/fail setup checks for trust, USB access, capture backend, `tshark`, output-folder permissions, and disk space, with a specific fix for each failure;
 - live progress, cancellation, retryable no-traffic preflight, and platform-specific errors;
-- an unmistakable completion card with packet count, file size, actual packet-span duration, saved location, and next actions;
+- a final capture receipt and completion card with SHA-256, full readable packet count, positive-data count, file size, exact packet span, requested duration, observed recording lifetime when available, and independent cleanup outcomes;
 
 - selecting or dropping an authorized PCAP, PCAPNG, or CAP file;
 - using a separate suggested baseline per device or imported investigation;
@@ -220,7 +220,8 @@ The desktop GUI presents capture, analysis, and setup checks as separate workspa
 - hiding device identifiers, exact commands, and raw process output under **Advanced details**;
 - copying redacted diagnostics that exclude device identifiers, packet data, and private paths;
 - summary, endpoint, DNS, TLS SNI, protocol, port, and entropy-heuristic views;
-- PTR reverse-DNS names and address-scope labels for every endpoint;
+- passive address-scope labels, with current PTR names available through an explicit action;
+- original-byte SHA-256, decoder-field coverage, and retained packet-record counts;
 - optional local MaxMind-compatible GeoIP city/country lookup without a web API;
 - TCP/UDP-aware service labels and plain-language port explanations;
 - a report-specific Interpretation view that explains scope, caveats, and next steps;
@@ -246,7 +247,7 @@ On macOS, the launcher builds and ad-hoc signs a lightweight runtime app wrapper
 
 The app opens on **Capture iPhone/iPad**. Connect the device by USB, unlock it, trust the host if prompted, and choose **Refresh Devices**. **New Capture…** opens a dialog for the device, duration, format, and output path. Offline devices are recognized but cannot be selected until connected. The **Check setup** tab verifies the local prerequisites before capture. On ChromeOS, USB devices must be shared with Linux individually under **Settings > Developers > Linux > USB preferences**; see Google's [Linux on ChromeOS FAQ](https://developers.google.com/chromeos/app-development/develop/linux-on-chromeos-faq).
 
-On macOS, the timed capture requires a physical, booted, paired iPhone/iPad connected over USB. It then uses a narrow native administrator authorization prompt for `tcpdump`; RVI-Sentinel never asks for, reads, stores, or transmits the Mac password. The countdown stays stopped while authorization is pending and during a five-second live-packet preflight. If the connected phone is idle, open a webpage on it and choose **Retry Traffic Check** without re-entering the capture settings. Completed captures are closed, checked for the requested PCAP/PCAPNG header, and required to contain at least one readable packet. The completion card remains on the Capture tab so the user chooses what happens next. The temporary RVI interface is removed after success, failure, or cancellation.
+On macOS, the timed capture requires a physical, booted, paired iPhone/iPad connected over USB. It then uses a narrow native administrator authorization prompt for `tcpdump`; RVI-Sentinel never asks for, reads, stores, or transmits the Mac password. The countdown stays stopped while authorization is pending and during a five-second live-packet preflight. If the connected phone is idle, open a webpage on it and choose **Retry Traffic Check** without re-entering the capture settings. The guided workflow attempts cleanup before emitting its final typed receipt. It requires complete passive TShark decoding of stable original bytes, the requested PCAP/PCAPNG format, and positive captured data for overall success. Recording outcome, artifact validation, recording-process shutdown, and interface removal are reported independently. A verified saved file remains available for manual passive analysis when recording or cleanup failed. Interface removal is claimed only after verification for an interface consistently attributed to this session; preexisting or ambiguously owned interfaces are preserved. The completion card remains on the Capture tab so the user chooses what happens next. The separate capture_rvi.sh and capture_mobile.py entrypoints retain their existing contracts; they do not emit guided receipts.
 
 On Linux (including the ChromeOS Linux development environment) and Windows, choose **Install Capture Support** once to clone the canonical `gh2o/rvi_capture` source into the ignored local `tools/` directory. Linux still requires `libimobiledevice` and `usbmuxd`; Windows still requires iTunes or Apple Mobile Device Support and its running service.
 
@@ -262,7 +263,39 @@ Analysis requires the same `tshark` runtime dependency as the CLI analyzer. Live
 
 Geolocation is deliberately local-only: RVI-Sentinel never sends captured endpoint IP addresses to a geolocation web API. To add approximate locations, download a current MaxMind-compatible City or Country `.mmdb` database, keep it outside version control (the repository's `data/` contents are ignored), and choose it in **Local GeoIP database** before analysis. MaxMind provides [GeoLite downloadable databases](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/) after account and license-key setup.
 
-IP geolocation is approximate. It often represents a network or nearby population center and must not be interpreted as the exact location of a device, person, or household. PTR hostnames are also attribution hints rather than proof: they may be absent, generic, stale, shared, or controlled by a hosting provider. Reverse-DNS resolution sends PTR queries for the observed addresses to the Mac's configured DNS resolver.
+IP geolocation is approximate. It often represents a network or nearby population center and must not be interpreted as the exact location of a device, person, or household. Saved-file analysis and automatic local GeoIP enrichment perform no PTR lookup. Choose **Resolve current PTR names** to query the host's configured DNS resolver explicitly; request/completion times and the result source are shown separately from captured DNS/SNI. PTR names may be absent, generic, stale, shared, or controlled by a hosting provider. **Cancel lookup** stops the current enrichment process; results do not alter the capture, report or baseline.
+
+### Guided capture receipts and timing
+
+Schema-v1 receipts carry a request nonce, exact selected output path, requested format/duration, recording outcome, full-file validation, artifact digest/count/timestamps, independent process/interface cleanup states, and distinct failure codes. The GUI rejects stale, malformed, duplicate, or missing receipts and does not infer successful capture or teardown from helper exit or file existence. A zero-length decoded frame is retained as readable frame evidence; it does not count as positive captured traffic.
+
+Requested duration, packet timestamp span, and observed recording lifetime are different quantities. A one-packet file has a zero packet span. Current macOS and upstream mobile connectors do not acknowledge the actual recording boundaries, so recording lifetime is explicitly unavailable. Authorization, startup, validation, cleanup, and provider process lifetime are not presented as recording duration.
+
+Cancellation requests cooperative owned-child shutdown. The native helper escalates from an interrupt through bounded termination, and a durable acknowledgement follows child reaping; killing the authorization wrapper alone leaves recording shutdown unverified. The GUI has a request-scoped 60-second escalation deadline. Verification of a saved partial file after cancellation has a 10-second cooperative deadline; an interrupted verification never promotes a completed artifact and preserves the file for later import.
+
+Streaming artifact verification retains counts and timestamp bounds without keeping a packet index. Its independent failure ceilings are 8 GiB input, 4 GiB decoder output, 4 KiB rows, 64 KiB diagnostics, 32 MiB capability probes, 30 seconds per probe, and 1,800 seconds overall. A generated 200,001-frame integration validates streaming behavior above the optional packet index limit; these ceilings are not full-capacity or UI-latency claims.
+
+Analysis started from the completion card checks the receipt digest before publishing reports. Changed bytes fail without replacing exports or updating the baseline. Explicitly selecting or dropping the file as a new import begins a fresh passive review with imported origin unknown.
+
+### Traceable saved-file analysis
+
+The analyzer probes the installed TShark field catalog, requests supported fields with active resolution disabled, and hashes the original before and after decoding. Every capture pass reads the already-open original descriptor, so replacing a source directory cannot substitute different decoded bytes under the original hash. Schema-v2 JSON reports retain the digest, unknown imported origin, supported/unavailable decoder fields, exact decimal packet epochs, frame numbers, lengths, streams and raw decoded field occurrences. Optional Apple PCAPNG/PKTAP process, effective-process, interface and direction labels retain their evidence source and explicit unknown/conflicting states. Recorded labels do not independently verify a device process owner. Unsupported decoder fields are distinct from supported fields absent in the capture; metadata-free PCAP remains useful.
+
+Existing endpoint/DNS/SNI/protocol/port summaries and CSVs remain available. Schema v2 counts all decoded field occurrences, including DNS questions previously omitted by first-occurrence extraction; ordinary single-occurrence frames keep their previous counts. Endpoint/port appearances do not establish connections, and ambiguous layered fields are not paired into invented endpoints. Packet records and structured DNS evidence are retained in the local JSON report; the Qt packet timeline, scoped TCP/UDP sessions, passive DNS candidates and decoded-field inspectors described below are available. Raw-byte inspection remains a separate capability.
+
+Saved analysis rejects changed originals, empty files, zero decoded records, nonregular/link inputs, malformed fields, incomplete frame coverage and exceeded resource limits. A valid container's zero-length frame is retained explicitly with no inferred network evidence. The configured ceilings are 1 GiB input, 200,000 records, 256 MiB estimated retained values, 128 KiB per decoder row, 512 MiB decoder output, 64 KiB diagnostics, 30 seconds per tool probe and 300 seconds for original hashing/decoding. JSON output is bounded at 512 MiB. These are explicit failure ceilings, not measured capacity or GUI-responsiveness claims. Choose a smaller saved capture when a limit is reached; analysis never silently truncates a successful report.
+
+Preview leaves the selected baseline unchanged, and **Add findings to baseline** requires the exact SHA-256 reviewed in that preview. Changed bytes require a new preview. Baseline observation counts still count reviewed analyses, while new capture references use content hashes and older history remains intact. Output paths must not alias a capture, baseline or another export, and staged JSON/baseline writes avoid truncating existing evidence. Individual output files are published atomically; the CSV/JSON bundle is not a multi-file transaction.
+
+For CLI preview without updating a baseline:
+
+```bash
+python3 analyze_preview.py captures/authorized.pcapng \
+  --baseline data/findings_master.json --export-dir exports \
+  --entropy-threshold 3.5 --top 20
+```
+
+The existing `analyze.py` CLI still explicitly updates its selected baseline. **Cancel analysis** in the GUI applies to preview; confirmed baseline persistence is not cancelled through that control.
 
 ### GUI screenshots
 
@@ -693,21 +726,53 @@ RVI-Sentinel does not attempt to bypass device security controls or decrypt prot
 
 ---
 
+### Packet timeline and inspector
+
+After a saved capture is analyzed, the **Packets** tab shows a time-ordered timeline beside a read-only decoded-field inspector. Ordering uses exact integer seconds and nanoseconds, then original frame number. Selection is bound to the capture SHA-256 and frame number, so table row positions cannot reattribute a packet after filtering or report replacement. Legacy aggregate-only reports show packet evidence as unavailable while retaining their existing findings.
+
+Enter literal case-insensitive search text or combine filters for an exact IP address on either side, either port, a complete protocol label/layer, recorded or effective process text, regular process state, interface text/state, and direction. Choose **Apply filters** or press Enter. Filters combine with AND; search has no regular-expression or operator syntax. Endpoint and port filters include every recorded layer occurrence and do not establish an endpoint/port pairing. Unknown and conflicting labels remain distinct. Process-state filtering applies to the regular process; effective-process labels remain searchable and visible in the inspector.
+
+Pages contain 100, 250, or 500 rows with exact total, matching, and page counts. Navigation uses the last applied filters. A selected packet stays selected when it matches; when outside the filter or visible page, its original inspector remains with an explicit notice. **Cancel query** keeps the last completed page and inspector for ordinary filters; an unfinished scope transition explicitly reports that no completed page is available. Replacing the loaded report clears old selection and pending results, including reloads of the same capture. Indexing, search, filtering, paging and report validation run in owned workers with one active query and one latest pending query per view. Window close and application Quit wait for owned workers to stop.
+
+The inspector preserves the exact epoch and nanosecond UTC display, hash/frame identity, endpoints and ports, lengths, protocol layers, transport/stream, every recorded process/effective-process/interface/direction label and source, repeated decoded field values, and diagnostics. Decoder-supported fields absent on this packet are distinct from unsupported fields. It also identifies the packet's scoped session or explains why it is ungrouped. The view renders literal text and performs no DNS/PTR lookup, capture mutation, baseline update, or export. It shows decoded fields; raw packet bytes are not inferred.
+
+Only the visible page is exposed to Qt's table model. Metadata cells exceeding 8 KiB show an explicit label-count summary. Inspector text exceeding 512 KiB is refused explicitly as a whole; hash/frame identity and the complete original report remain available. Report loading rejects links and special files, checks stable file identity, limits serialized input to 512 MiB, and enforces the existing 200,000-record and 256 MiB estimated retained-value ceilings. These are failure/rendering limits, not full-capacity or latency guarantees. Generated 50k/100k queries and real 10k-frame report loading are measured separately in the GUI integration suite; shared-metadata query fixtures do not establish decoder-inclusive RSS or physical-device behavior.
+
+### Scoped sessions and packet navigation
+
+The **Sessions** tab groups saved TCP/UDP observations only when a decoder stream and an unambiguous complete address/port pair are available. A group is scoped by capture SHA-256, transport, stream, normalized bidirectional endpoint pair, recorded interface context, and both regular and effective process contexts. Metadata sources are part of the scope. Reverse directions join; TCP and UDP streams with the same number, different endpoints, interfaces or process labels remain separate. Unknown context is an exact scope and never a wildcard for recorded context. Conflicting process, effective-process, interface or direction evidence, ambiguous headers, missing endpoints/ports/streams and other transports remain ungrouped with explicit reasons. A frame may have several reasons, so reason counts need not sum to the unique ungrouped count.
+
+Sessions show literal search, combined endpoint/port/transport/process/interface filters, exact packet and session counts, and bounded 100/250/500-row pages. The scope inspector shows original metadata sources, exact first/last observed timestamps, wire bytes and captured bytes; unavailable captured lengths stay explicit. A stable versioned scope digest identifies each group within its capture. Grouping preserves the original immutable records and partitions every frame into one eligible session or one ungrouped entry. This is passive correlation of saved observations: it does not prove TCP state, connection lifetime, process ownership or completeness, and does not invent idle-time boundaries. DNS candidate associations have the additional evidence boundaries described below.
+
+**Show member packets** opens a timeline restricted to that group's exact frame identities. **Show ungrouped packets** exposes excluded frames and their reasons. From a selected packet, **Show owning session** reveals its group while retaining the packet return context; the label describes grouping, not forensic ownership. **Return to previous packet view** restores that packet scope, applied filters, page, selection and inspector. **Back to sessions** restores the originating session view. **Restore previous packet view** on the packet tab restores the packet view that preceded session navigation. Return snapshots also preserve scroll position and are invalidated on every report replacement. Analysis settings collapse on entering an evidence tab to leave room for rows and inspectors; **Show settings** reopens them.
+
+Correlation runs locally in a cancellable worker. The additional session index has a 200,000-frame ceiling and a 256 MiB estimated storage ceiling, separate from report retention; these estimates are not process RSS limits. The session GUI integration suite measures generated 50k/100k-frame corpora containing 25k/50k distinct bidirectional groups with varied process and interface labels, independently from small real-decoder PCAP/PCAPNG fixtures. Neither establishes full-capacity responsiveness or physical-device metadata availability.
+
+### Passive DNS evidence and session navigation
+
+The **DNS evidence** tab shows candidate name/address associations with scoped sessions. Saved files containing DNS, mDNS or LLMNR receive a separate passive structured TShark pass with active name resolution disabled. The report retains message boundaries, questions, answer owners/types/classes/TTLs/values, flags, complete response codes, decoder frame/message ordinals and linked query frames. Authority and additional records cannot supply answer candidates. Older reports without this optional schema-v2 evidence show it as unavailable; an analyzed file with no observed DNS messages has an explicit empty collection.
+
+A candidate requires a captured, uniquely linked standard unicast DNS query and response on port 53, with the same transport/stream, reversed endpoint tuple and exact interface context. Only one IN A or AAAA question and a successful, untruncated response can produce an association. An unambiguous acyclic CNAME chain is followed for at most 16 hops. Its validity uses the minimum CNAME and terminal RRset TTL; zero and invalid high-bit TTLs do not associate later traffic. Unsupported records, multicast/LLMNR, errors, unlinked or ambiguous messages and metadata conflicts stay inspectable with explicit exclusion reasons.
+
+Only original session member frames matching the client, answer address and interface within the half-open response-to-expiry window are associated. Query/response packets themselves are excluded. The inspector shows both the original TTL expiry and the effective expiry after a later linked negative, replacement or dependency response, with navigation to that superseding source. CNAME/address replacements end earlier dependency evidence while independent A and AAAA records remain separate. Multiple names sharing an IP stay separate candidates. Captured DNS does not authenticate a resolver or prove application name use or process ownership; recorded response/session process context is compared explicitly as same, different or unknown.
+
+From a session, **Show DNS evidence** applies its exact scope. A selected candidate can open its original query, response or superseding response packet, only its matched member packets, or its correlated session. Return actions restore the originating filters, page, selection, inspector and scroll position. Every reference is bound to the capture SHA-256 and original frame/record identity, and report reloads invalidate old navigation even when the digest is unchanged. Packet inspectors also show complete structured DNS message evidence, including NXDOMAIN and extended response codes. Observed DNS frames and excluded-message diagnostics remain available even when no candidate qualifies.
+
+All correlation and navigation are local and leave the capture, report, exports and baseline unchanged. DNS parsing has separate 64 MiB serialized/estimated-retention limits, 100,000 messages, 200,000 combined questions/answer records, 48-level JSON depth and 1,024-byte names. Correlation fails explicitly above 200,000 associations, 64 MiB estimated association storage or 2,000,000 member/candidate comparisons. These are failure ceilings, not full-capacity RSS or responsiveness claims. Cancelling a query preserves its last completed page; window close and application Quit wait for owned workers.
+
 ## Testing without live capture
 
-Run:
+For the dependency-free deterministic analyzer check, run:
 
 ```bash
 python3 tests/test_analyzer.py
-python3 -m tests.test_capture_models
-python3 -m tests.test_gui_models
-python3 -m tests.test_finding_enrichment
-QT_QPA_PLATFORM=offscreen venv/bin/python -m tests.test_gui_integration
 ```
 
-The automated tests do not connect to an iPhone, invoke `rvictl`, create `rvi0`, request administrator authorization, or capture live traffic. They validate physical-device readiness parsing, bounded capture requests, Apple PCAP/PCAPNG mode selection, clean termination, post-capture header checks, countdown/finalization state, deterministic `tshark` field output, and the analysis layer independently. Live validation remains an explicit local action because it requires a connected trusted device and native authorization.
+The complete analyzer, real-decoder, capture-receipt, packet/session/DNS, Qt and native launcher commands are maintained in [CONTRIBUTING.md](CONTRIBUTING.md#validation). Run those checks for a complete port checkpoint.
 
-The GUI integration test uses the same deterministic field stream to exercise Qt process execution, report loading, and results presentation without displaying a window or requiring live capture.
+The automated tests do not connect to an iPhone, invoke `rvictl`, create `rvi0`, request administrator authorization, or capture live traffic. They validate physical-device readiness parsing, bounded capture requests, Apple PCAP/PCAPNG mode selection, bounded child shutdown, complete-file validation, receipt binding and independent cleanup outcomes, countdown/finalization state, deterministic `tshark` field output, and the analysis layer independently. Live validation remains an explicit local action because it requires a connected trusted device and native authorization.
+
+The GUI integration test uses the same deterministic field stream to exercise Qt process execution, report loading, results presentation, passive enrichment, explicit localhost PTR and cancellation without displaying a window or requiring live capture. The saved-file suite requires real TShark on PATH and generates valid classic PCAP and metadata-rich PCAPNG in temporary directories. It verifies original-byte integrity, exact timestamps, repeated DNS values, optional metadata, invalid inputs, resource limits and bounded child cleanup. Receipt tests execute generated shell commands against task-owned synthetic recorders and controlled connector boundaries, without a privileged device operation. Synthetic labels establish decoding, not metadata availability or process identity on every physical device.
 
 Expected completion includes:
 
@@ -722,13 +787,27 @@ PASS: analyzer works without rvictl/rvi0
 ```text
 RVI-Sentinel/
 ├── analyze.py
+├── analyze_preview.py        # passive preview without baseline writes
+├── analyze_reviewed.py       # digest-bound reviewed baseline update
+├── analyze_captured.py       # receipt-bound passive preview before export
+├── analysis_baseline.py      # validated v1 history and pure updates
+├── packet_models.py          # immutable decoded evidence and report validation
+├── saved_capture.py          # bounded passive decoding and original-byte integrity
 ├── capture_models.py          # typed device and bounded capture contracts
 ├── capture_devices.py         # macOS/Linux/Windows device discovery
 ├── capture_session.py         # timed platform-aware capture runner
-├── enrich_endpoints.py        # bounded PTR and local GeoIP enrichment process
+├── capture_receipt.py         # final typed outcomes and strict GUI boundary
+├── capture_stats.py           # complete streaming artifact validation
+├── enrich_endpoints.py        # explicitly requested current PTR process
+├── local_endpoint_enrichment.py # passive scope and local GeoIP process
 ├── finding_enrichment.py      # address, location, and port explanations
 ├── gui.py                     # PySide6 capture and analysis desktop UI
-├── gui_models.py              # typed request/report validation
+├── gui_models.py              # typed request/report and retained packet validation
+├── report_loader.py           # owned cancellable Qt report worker
+├── packet_timeline.py         # pure exact ordering, filters and bounded pages
+├── packet_view.py             # Qt timeline model, query worker and inspector
+├── packet_sessions.py         # pure evidence-scoped TCP/UDP grouping and queries
+├── session_view.py            # Qt scoped session model, worker and inspector
 ├── capture_rvi.sh             # macOS rvictl/rvi0 capture
 ├── capture_mobile.py          # Linux/Windows frontend
 ├── scripts/
@@ -754,7 +833,19 @@ RVI-Sentinel/
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_capture_models.py
+│   ├── test_capture_stats.py
+│   ├── test_capture_receipts.py
+│   ├── test_packet_timeline.py
+│   ├── test_packet_view.py
+│   ├── test_packet_gui_integration.py
+│   ├── packet_timeline_fixture.py
+│   ├── test_packet_sessions.py
+│   ├── test_session_view.py
+│   ├── test_session_gui_integration.py
+│   ├── session_fixture.py
 │   ├── test_finding_enrichment.py
+│   ├── test_saved_capture.py
+│   ├── saved_capture_fixture.py
 │   ├── test_gui_integration.py
 │   └── test_gui_models.py
 ├── captures/
@@ -770,7 +861,7 @@ RVI-Sentinel/
 
 Packet captures and device identifiers can reveal sensitive metadata even when payloads are encrypted. The repository ignores PCAP files, generated reports, local baselines, and the local upstream checkout by default. The GUI keeps capture files and device identifiers local and does not upload them.
 
-Endpoint geolocation uses only the local `.mmdb` file selected by the user. RVI-Sentinel does not send captures, reports, DNS names, SNI values, or endpoint lists to a geolocation web API. PTR hostname resolution does query the Mac's configured DNS resolver for each observed endpoint.
+Endpoint geolocation uses only the local `.mmdb` file selected by the user. RVI-Sentinel does not send captures, reports, DNS names, SNI values, or endpoint lists to a geolocation web API. Current PTR resolution queries the host's configured DNS resolver only after the explicit lookup action; saved-file analysis is passive.
 
 Use RVI-Sentinel only with devices, networks, and packet captures you own or are explicitly authorized to inspect.
 

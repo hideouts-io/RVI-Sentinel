@@ -169,7 +169,7 @@ def main() -> None:
             raise AssertionError("Offline device unexpectedly passed capture validation.")
 
     interface = select_created_interface(
-        frozenset(), frozenset({"rvi0"}), "Starting device"
+        frozenset(), frozenset({"rvi0"}), "[SUCCEEDED] with interface rvi0"
     )
     assert interface == "rvi0"
     rvi_interfaces = parse_rvi_interfaces("lo0 en0 awdl0 rvi0 rvi12")
@@ -197,9 +197,7 @@ def main() -> None:
         30,
     )
     assert "'/tmp/Authorized Capture.pcapng'" in command
-    assert "capture_deadline=$((capture_started_at + 30))" in command
-    assert '"$(/bin/date +%s)" -lt "$capture_deadline"' in command
-    assert "capture_elapsed" not in command
+    assert "capture_remaining=30" in command
     syntax_check = subprocess.run(
         ["/bin/sh", "-n", "-c", command],
         capture_output=True,
@@ -211,7 +209,7 @@ def main() -> None:
     assert "-c 1" in command
     assert "-P -Z researcher" in command
     assert "/bin/kill -INT" in command
-    assert "/bin/kill -TERM" not in command
+    assert "capture-stopped" in command
     assert "administrator" not in command
 
     pcap_command = native_authorized_tcpdump_command(
@@ -237,7 +235,7 @@ def main() -> None:
                 "/usr/sbin/tcpdump", invalid_capture, "pcapng"
             )
         except CaptureSessionError as error:
-            assert "requested pcapng header" in str(error)
+            assert "validation failed" in str(error)
         else:
             raise AssertionError("Invalid capture unexpectedly passed format validation.")
 

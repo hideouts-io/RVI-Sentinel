@@ -98,12 +98,21 @@ def main() -> None:
         else:
             raise AssertionError("Invalid report unexpectedly passed validation.")
 
+        invalid_report.write_bytes(b"\xff\xfe invalid UTF-8 report")
+        try:
+            load_report(invalid_report)
+        except ReportValidationError as error:
+            assert isinstance(error.__cause__, UnicodeDecodeError)
+        else:
+            raise AssertionError("Non-UTF-8 report unexpectedly passed validation.")
+
         print("PASS: GUI request validation")
         print("PASS: exact analyzer argument construction")
         print("PASS: report path derivation")
         print("PASS: typed report parsing")
         print("PASS: new-versus-known presentation data")
         print("PASS: invalid report rejection")
+        print("PASS: invalid UTF-8 report returns a typed validation failure")
 
 
 if __name__ == "__main__":

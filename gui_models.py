@@ -4,9 +4,20 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+import threading
+import os
+import stat
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, cast
+
+from analyze import epoch_iso
+from packet_models import PCAPNG_PROCESS_FIELDS, PacketRecord, PacketTimestamp, PacketValidationError, estimated_packet_bytes, validate_packet_document
+from captured_dns import CapturedDnsEvidence, CapturedDnsValidationError, CapturedDnsCancelled, validate_dns_evidence_document
+from saved_capture import OPTIONAL_FIELDS, PROTOCOL_FIELDS, REQUIRED_FIELDS
 
 CAPTURE_SUFFIXES = frozenset({".cap", ".pcap", ".pcapng"})
 
@@ -72,6 +83,18 @@ class AnalysisSummary:
 
 
 @dataclass(frozen=True)
+class AnalysisEvidence:
+    sha256: str
+    tshark_version: str
+    supported_field_count: int
+    supported_fields: tuple[str, ...]
+    unsupported_fields: tuple[str, ...]
+    packet_record_count: int
+    origin: str
+    integrity: str
+
+
+@dataclass(frozen=True)
 class AnalysisReport:
     capture: CaptureDetails
     summary: AnalysisSummary
@@ -81,6 +104,9 @@ class AnalysisReport:
     protocols: tuple[RankedFinding, ...]
     ports: tuple[PortFinding, ...]
     entropy_findings: tuple[EntropyFinding, ...]
+    evidence: AnalysisEvidence | None
+    packets: tuple[PacketRecord, ...]
+    dns_evidence: CapturedDnsEvidence | None
 
 
 def validate_request(request: AnalysisRequest) -> None:
@@ -98,7 +124,7 @@ def validate_request(request: AnalysisRequest) -> None:
         raise RequestValidationError(
             f"Export directory path is not a directory: {request.export_directory}"
         )
-    if request.entropy_threshold < 0.0 or request.entropy_threshold > 8.0:
+    if not math.isfinite(request.entropy_threshold) or request.entropy_threshold < 0.0 or request.entropy_threshold > 8.0:
         raise RequestValidationError("Entropy threshold must be between 0.0 and 8.0.")
     if request.top_count < 0 or request.top_count > 500:
         raise RequestValidationError("Top result count must be between 0 and 500.")
@@ -124,15 +150,87 @@ def report_path_for(request: AnalysisRequest) -> Path:
     return request.export_directory / f"{request.capture_path.stem}_report.json"
 
 
+class ReportLoadCancelled(ReportValidationError):
+    """The caller cancelled loading before a completed report was returned."""
+
+
+def check_report_cancellation(cancellation: threading.Event) -> None:
+    if cancellation.is_set():
+        raise ReportLoadCancelled("Report loading was cancelled; no completed report was returned.")
+
+
+def report_file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def unique_report_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReportValidationError("Analyzer report contains a duplicate JSON property.")
+        result[key] = value
+    return result
+
+
 def load_report(path: Path) -> AnalysisReport:
+    """Load a validated report synchronously for CLI and non-UI callers."""
+    return load_report_cancellable(path, threading.Event())
+
+
+def load_report_cancellable(path: Path, cancellation: threading.Event) -> AnalysisReport:
+    """Read a stable bounded report and retain its validated immutable packet evidence.
+
+    GUI callers run this connector in an owned worker. JSON decoding itself is a
+    bounded library operation; cancellation is checked around it and throughout
+    packet validation. No capture, baseline or export is modified.
+    """
+    check_report_cancellation(cancellation)
     try:
-        payload: object = json.loads(path.read_text(encoding="utf-8"))
+        expected = path.lstat()
+        if not stat.S_ISREG(expected.st_mode) or not 0 < expected.st_size <= 536_870_912:
+            raise ReportValidationError("Analyzer report must be a nonempty regular file within the 512 MiB report limit; links and special files are not accepted.")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        with ExitStack() as cleanup:
+            descriptor = os.open(path, flags)
+            cleanup.callback(os.close, descriptor)
+            stream = cleanup.enter_context(os.fdopen(descriptor, "rb", closefd=False))
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or report_file_identity(before) != report_file_identity(expected):
+                raise ReportValidationError("Analyzer report changed while opening. Run analysis again before reviewing it.")
+            content = bytearray()
+            while True:
+                check_report_cancellation(cancellation)
+                chunk = stream.read(1_048_576)
+                if not chunk:
+                    break
+                content.extend(chunk)
+                if len(content) > 536_870_912:
+                    raise ReportValidationError("Analyzer report exceeded the 512 MiB report limit while reading.")
+            after = os.fstat(stream.fileno())
+            current = path.lstat()
+            if not stat.S_ISREG(current.st_mode) or report_file_identity(before) != report_file_identity(after) or report_file_identity(before) != report_file_identity(current):
+                raise ReportValidationError("Analyzer report changed while reading. Run analysis again before reviewing it.")
+        check_report_cancellation(cancellation)
+
+        def checked_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            check_report_cancellation(cancellation)
+            return unique_report_object(pairs)
+
+        payload: object = json.loads(content.decode("utf-8"), object_pairs_hook=checked_object)
+        del content
+        check_report_cancellation(cancellation)
     except FileNotFoundError as error:
         raise ReportValidationError(f"Analyzer report not found: {path}") from error
-    except json.JSONDecodeError as error:
-        raise ReportValidationError(
-            f"Analyzer report is not valid JSON: {path}: {error}"
-        ) from error
+    except UnicodeDecodeError as error:
+        raise ReportValidationError(f"Analyzer report is not valid UTF-8: {path}") from error
+    except ReportValidationError:
+        raise
+    except (ValueError, RecursionError) as error:
+        raise ReportValidationError("Analyzer report is not valid bounded JSON.") from error
     except OSError as error:
         raise ReportValidationError(f"Could not read analyzer report: {path}: {error}") from error
 
@@ -192,6 +290,18 @@ def load_report(path: Path) -> AnalysisReport:
         new_tls_sni=new_tls_sni,
     )
 
+    evidence, packets = parse_packet_evidence(root, capture_data, capture.packet_count, cancellation)
+    dns_evidence: CapturedDnsEvidence | None = None
+    if "dns_evidence" in root:
+        if evidence is None:
+            raise ReportValidationError("Structured DNS evidence requires capture-bound packet records.")
+        try:
+            dns_evidence = validate_dns_evidence_document(root["dns_evidence"], evidence.sha256, packets, cancellation)
+        except CapturedDnsCancelled as error:
+            raise ReportLoadCancelled("Report DNS validation was cancelled.") from error
+        except CapturedDnsValidationError as error:
+            raise ReportValidationError(f"Structured DNS report evidence is invalid: {error}") from error
+    check_report_cancellation(cancellation)
     return AnalysisReport(
         capture=capture,
         summary=summary,
@@ -213,6 +323,9 @@ def load_report(path: Path) -> AnalysisReport:
         entropy_findings=parse_entropy_findings(
             require_field(root, "dns_entropy_findings", "report")
         ),
+        evidence=evidence,
+        packets=packets,
+        dns_evidence=dns_evidence,
     )
 
 
@@ -224,6 +337,120 @@ def require_mapping(value: object, field: str) -> Mapping[str, object]:
         if not isinstance(key, str):
             raise ReportValidationError(f"{field} contains a non-string key.")
     return cast(dict[str, object], value)
+
+
+def require_nonnegative_integer(value: object, field: str) -> int:
+    number = require_integer(value, field)
+    if number < 0:
+        raise ReportValidationError(f"{field} must be nonnegative.")
+    return number
+
+
+def evidence_texts(value: object, field: str) -> tuple[str, ...]:
+    rows = require_list(value, field)
+    if len(rows) > 128:
+        raise ReportValidationError(f"{field} exceeds the 128-field coverage limit.")
+    texts = tuple(require_string(row, field) for row in rows)
+    if any(not text or len(text) > 256 or any(ord(character) < 32 for character in text) for text in texts):
+        raise ReportValidationError(f"{field} contains invalid field text.")
+    if len(set(texts)) != len(texts):
+        raise ReportValidationError(f"{field} contains duplicate fields.")
+    return texts
+
+
+def parse_analysis_evidence(root: Mapping[str, object], capture: Mapping[str, object], packet_count: int) -> AnalysisEvidence | None:
+    """Preserve the evidence-only API while validated GUI reports retain packets."""
+    evidence, _packets = parse_packet_evidence(root, capture, packet_count, threading.Event())
+    return evidence
+
+
+def parse_packet_evidence(root: Mapping[str, object], capture: Mapping[str, object], packet_count: int,
+                          cancellation: threading.Event) -> tuple[AnalysisEvidence | None, tuple[PacketRecord, ...]]:
+    """Legacy summaries have no packet records; v2 retains complete typed evidence."""
+    if "schema_version" not in root:
+        return None, ()
+    version = require_integer(root["schema_version"], "schema_version")
+    if version != 2:
+        raise ReportValidationError(f"Unsupported report schema version: {version}.")
+    sha256 = require_string(require_field(capture, "sha256", "capture"), "capture.sha256")
+    if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise ReportValidationError("capture.sha256 must be a lowercase SHA-256 digest.")
+    capture_id = require_string(require_field(capture, "capture_id", "capture"), "capture.capture_id")
+    if capture_id != "sha256:" + sha256:
+        raise ReportValidationError("Capture identity does not match its digest.")
+    integrity = require_string(require_field(capture, "integrity", "capture"), "capture.integrity")
+    origin = require_string(require_field(capture, "origin", "capture"), "capture.origin")
+    if integrity != "verified" or origin != "imported_unknown":
+        raise ReportValidationError("Saved-file reports must retain verified bytes and unknown imported origin.")
+    decoder = require_mapping(require_field(root, "decoder", "report"), "decoder")
+    if require_field(decoder, "active_resolution_enabled", "decoder") is not False:
+        raise ReportValidationError("Saved-file analysis must not enable active resolution.")
+    tshark_version = require_string(require_field(decoder, "tshark_version", "decoder"), "decoder.tshark_version")
+    if not tshark_version or len(tshark_version) > 512 or any(ord(character) < 32 for character in tshark_version):
+        raise ReportValidationError("decoder.tshark_version contains invalid text.")
+    supported = evidence_texts(require_field(decoder, "supported_fields", "decoder"), "decoder.supported_fields")
+    unsupported = evidence_texts(require_field(decoder, "unsupported_fields", "decoder"), "decoder.unsupported_fields")
+    container_fields = evidence_texts(decoder["container_fields"], "decoder.container_fields") if "container_fields" in decoder else ()
+    if container_fields not in ((), PCAPNG_PROCESS_FIELDS):
+        raise ReportValidationError("Container coverage must be absent or the complete Apple PCAPNG process field schema.")
+    if set(supported) & set(unsupported):
+        raise ReportValidationError("Decoder fields cannot be both supported and unsupported.")
+    if not set(REQUIRED_FIELDS).issubset(supported) or len(set(PROTOCOL_FIELDS).intersection(supported)) != 1:
+        raise ReportValidationError("Decoder coverage is missing required packet identity fields.")
+    if not set(OPTIONAL_FIELDS).issubset(set(supported) | set(unsupported)) or not set(unsupported).issubset(OPTIONAL_FIELDS):
+        raise ReportValidationError("Decoder coverage must account for every requested optional field.")
+    if not set(supported).issubset(set(REQUIRED_FIELDS) | set(PROTOCOL_FIELDS) | set(OPTIONAL_FIELDS)):
+        raise ReportValidationError("Decoder coverage contains fields outside this report's requested schema.")
+    records = require_list(require_field(root, "packets", "report"), "packets")
+    if not 0 < len(records) <= 200_000 or len(records) != packet_count:
+        raise ReportValidationError("Packet record count must match the complete capture count and stay within the index limit.")
+    frames: set[int] = set()
+    timestamps: list[PacketTimestamp] = []
+    packets: list[PacketRecord] = []
+    retained_bytes = 0
+    for index, value in enumerate(records):
+        check_report_cancellation(cancellation)
+        try:
+            packet = validate_packet_document(value)
+        except PacketValidationError as error:
+            raise ReportValidationError(f"packets[{index}] is not valid traceable packet evidence: {error}") from error
+        retained_bytes += estimated_packet_bytes(packet)
+        if retained_bytes > 268_435_456:
+            raise ReportValidationError("Packet evidence exceeds the 256 MiB retained-value limit.")
+        packets.append(packet)
+        frame = packet.frame_number
+        if frame == 0 or frame in frames:
+            raise ReportValidationError("Packet frame identities must be positive and unique within the original.")
+        frames.add(frame)
+        timestamps.append(packet.timestamp)
+        if any(field.name not in supported + container_fields for field in packet.fields):
+            raise ReportValidationError("Packet fields must be present in decoder or independently declared container coverage.")
+    if frames != set(range(1, len(records) + 1)):
+        raise ReportValidationError("Complete saved-file reports must retain every contiguous frame identity.")
+    first = min(timestamps, key=lambda epoch: (epoch.seconds, epoch.nanoseconds))
+    last = max(timestamps, key=lambda epoch: (epoch.seconds, epoch.nanoseconds))
+    expected_duration = round(((last.seconds - first.seconds) * 1_000_000_000 + last.nanoseconds - first.nanoseconds) / 1_000_000_000, 3)
+    if require_field(capture, "first_packet_epoch", "capture") != first.epoch or require_field(capture, "last_packet_epoch", "capture") != last.epoch:
+        raise ReportValidationError("Capture epoch bounds do not match the retained packet records.")
+    try:
+        first_display = epoch_iso(first)
+        last_display = epoch_iso(last)
+    except ValueError as error:
+        raise ReportValidationError("Packet epoch cannot be represented as the report's display time.") from error
+    if capture.get("first_packet") != first_display or capture.get("last_packet") != last_display or capture.get("duration_seconds") != expected_duration:
+        raise ReportValidationError("Capture display times or duration do not match the retained packet records.")
+    evidence = AnalysisEvidence(
+        sha256=sha256,
+        tshark_version=tshark_version,
+        supported_field_count=len(supported),
+        supported_fields=supported,
+        unsupported_fields=unsupported,
+        packet_record_count=len(records),
+        origin=origin,
+        integrity=integrity,
+    )
+    check_report_cancellation(cancellation)
+    return evidence, tuple(packets)
 
 
 def require_field(mapping: Mapping[str, object], key: str, field: str) -> object:
@@ -253,13 +480,20 @@ def require_optional_string(value: object, field: str) -> str | None:
 def require_integer(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ReportValidationError(f"{field} must be an integer.")
+    if value < 0:
+        raise ReportValidationError(f"{field} must be nonnegative.")
     return value
 
 
 def require_number(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReportValidationError(f"{field} must be a number.")
-    return float(value)
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ReportValidationError(f"{field} must be finite.")
+    if converted < 0:
+        raise ReportValidationError(f"{field} must be nonnegative.")
+    return converted
 
 
 def require_optional_number(value: object, field: str) -> float | None:
