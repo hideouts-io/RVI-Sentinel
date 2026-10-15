@@ -44,7 +44,7 @@ The analyzer requires `tshark`. Live capture has additional platform-specific pr
 Run the checks relevant to your change. For a complete analyzer and GUI change, run:
 
 ```bash
-venv/bin/python -m py_compile analyze.py analyze_preview.py analyze_reviewed.py analyze_captured.py analysis_baseline.py packet_models.py pcapng_process.py saved_capture.py captured_dns.py dns_sessions.py dns_view.py capture_models.py capture_devices.py capture_session.py capture_receipt.py capture_stats.py capture_mobile.py gui.py gui_shell.py gui_models.py packet_timeline.py packet_view.py packet_sessions.py session_view.py report_loader.py enrich_endpoints.py local_endpoint_enrichment.py finding_enrichment.py
+venv/bin/python -m py_compile analyze.py analyze_preview.py analyze_reviewed.py analyze_captured.py analysis_baseline.py packet_models.py pcapng_process.py saved_capture.py captured_dns.py dns_sessions.py dns_view.py capture_models.py capture_devices.py capture_session.py capture_receipt.py capture_stats.py capture_mobile.py gui.py gui_shell.py gui_icons.py gui_models.py packet_timeline.py packet_view.py packet_sessions.py session_view.py report_loader.py enrich_endpoints.py local_endpoint_enrichment.py finding_enrichment.py
 python3 tests/test_analyzer.py
 venv/bin/python -m tests.test_capture_models
 venv/bin/python -m tests.test_gui_models

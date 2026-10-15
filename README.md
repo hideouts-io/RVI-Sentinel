@@ -228,20 +228,38 @@ The desktop GUI uses a sidebar for Overview, Check setup, Device & Capture, Anal
 - explicit new-versus-known baseline labels;
 - opening the generated export directory.
 
-Create a project-local environment and install the optional GUI dependency:
+On macOS or Linux, create a project-local environment and install the optional GUI dependencies:
 
 ```bash
 python3 -m venv venv
 venv/bin/python -m pip install -r requirements-gui.txt
 ```
 
+On Windows, use PowerShell from the repository root:
+
+```powershell
+py -3.13 -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\venv\Scripts\python.exe gui.py
+```
+
+Install TShark separately and make its executable available on `PATH` for saved-file analysis. The GUI keeps its Python helper text pipes in UTF-8, including filenames and diagnostics containing Unicode.
+
 Use the non-hidden `venv/` directory shown above. In macOS File Provider-managed folders, a dot-prefixed environment such as `.venv/` can propagate the hidden file flag to Qt plugins and prevent the Cocoa platform plugin from being discovered.
 
-Launch the GUI:
+Launch the GUI on macOS:
 
 ```bash
 ./scripts/run_gui.sh
 ```
+
+On Linux, launch it directly from the project environment:
+
+```bash
+venv/bin/python gui.py
+```
+
+The direct Python entry point accepts a saved capture path and `--smoke-test` on each platform. `scripts/run_gui.sh` requires zsh; the direct Linux and Windows commands do not.
 
 On macOS, the launcher builds and ad-hoc signs a lightweight runtime app wrapper in the system temporary directory, outside a File Provider-managed Documents checkout. It starts with the project icon so RVI-Sentinel has its own Dock identity while all source, captures, baselines, and exports remain at their selected project paths. The generated wrapper stays outside version control and is recreated by `scripts/run_gui.sh`.
 

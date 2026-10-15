@@ -6,15 +6,18 @@ name, writes a baseline, or reconstructs an evidence widget.
 
 from __future__ import annotations
 
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QGridLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QScrollArea, QSizePolicy, QStyle, QVBoxLayout, QWidget,
+    QApplication, QGridLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-Destination = Literal["overview", "setup", "capture", "analysis", "baselines", "exports", "diagnostics"]
+from gui_icons import WorkspaceIconKey, workspace_icon
+
+Destination = WorkspaceIconKey
 
 
 class WorkspaceDestination(NamedTuple):
@@ -23,18 +26,18 @@ class WorkspaceDestination(NamedTuple):
     key: Destination
     title: str
     subtitle: str
-    icon: QStyle.StandardPixmap
+    icon: WorkspaceIconKey
     workspace_index: int | None
 
 
 DESTINATIONS: tuple[WorkspaceDestination, ...] = (
-    WorkspaceDestination("overview", "Overview", "Local capture and evidence analysis", QStyle.StandardPixmap.SP_ComputerIcon, None),
-    WorkspaceDestination("setup", "Check setup", "Verify this computer and the selected device", QStyle.StandardPixmap.SP_DialogApplyButton, 2),
-    WorkspaceDestination("capture", "Device & Capture", "Record an authorized iPhone or iPad capture", QStyle.StandardPixmap.SP_DriveNetIcon, 0),
-    WorkspaceDestination("analysis", "Analysis", "Inspect saved packets, scoped sessions, and DNS evidence", QStyle.StandardPixmap.SP_FileDialogContentsView, 1),
-    WorkspaceDestination("baselines", "Baselines", "Choose persistent history and review changes before applying them", QStyle.StandardPixmap.SP_DirHomeIcon, None),
-    WorkspaceDestination("exports", "Exports", "Choose and open the local analysis output directory", QStyle.StandardPixmap.SP_DirOpenIcon, None),
-    WorkspaceDestination("diagnostics", "Diagnostics", "Review local status and copy redacted troubleshooting details", QStyle.StandardPixmap.SP_MessageBoxInformation, None),
+    WorkspaceDestination("overview", "Overview", "Local capture and evidence analysis", "overview", None),
+    WorkspaceDestination("setup", "Check setup", "Verify this computer and the selected device", "setup", 2),
+    WorkspaceDestination("capture", "Device & Capture", "Record an authorized iPhone or iPad capture", "capture", 0),
+    WorkspaceDestination("analysis", "Analysis", "Inspect saved packets, scoped sessions, and DNS evidence", "analysis", 1),
+    WorkspaceDestination("baselines", "Baselines", "Choose persistent history and review changes before applying them", "baselines", None),
+    WorkspaceDestination("exports", "Exports", "Choose and open the local analysis output directory", "exports", None),
+    WorkspaceDestination("diagnostics", "Diagnostics", "Review local status and copy redacted troubleshooting details", "diagnostics", None),
 )
 
 
@@ -68,13 +71,14 @@ def scroll_page(content: QWidget, name: str, parent: QWidget) -> QScrollArea:
 
 
 def populate_sidebar(sidebar: QListWidget) -> None:
+    """Share the application palette used by shell stylesheet palette() colors."""
     sidebar.setObjectName("navigationSidebar")
     sidebar.setAccessibleName("Application workspaces")
     sidebar.setIconSize(QSize(18, 18))
     sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     sidebar.setFixedWidth(180)
     for destination in DESTINATIONS:
-        item = QListWidgetItem(sidebar.style().standardIcon(destination.icon), destination.title)
+        item = QListWidgetItem(workspace_icon(destination.icon, QApplication.palette()), destination.title)
         item.setData(Qt.ItemDataRole.UserRole, destination.key)
         item.setSizeHint(QSize(170, 38))
         sidebar.addItem(item)
@@ -93,13 +97,36 @@ def workflow_card(destination: WorkspaceDestination, parent: QWidget) -> QPushBu
     layout.setContentsMargins(16, 12, 16, 12)
     layout.setSpacing(5)
     icon = QLabel(button)
-    icon.setPixmap(button.style().standardIcon(destination.icon).pixmap(24, 24))
+    icon.setObjectName("overview" + destination.key.title() + "Icon")
+    icon.setPixmap(workspace_icon(destination.icon, QApplication.palette()).pixmap(
+        QSize(24, 24), icon.devicePixelRatioF(), QIcon.Mode.Normal, QIcon.State.Off,
+    ))
     title = plain_label(destination.title, "workflowTitle", button)
     description = plain_label(destination.subtitle, "workflowDescription", button)
     for label in (icon, title, description):
         label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(label)
     return button
+
+
+def refresh_workspace_icons(sidebar: QListWidget, cards: tuple[tuple[Destination, QPushButton], ...]) -> None:
+    """Refresh application palette and display scale while preserving widgets."""
+    if sidebar.count() != len(DESTINATIONS):
+        raise RuntimeError("Workspace sidebar has an unexpected number of destinations")
+    for position, destination in enumerate(DESTINATIONS):
+        item = sidebar.item(position)
+        if item is None or item.data(Qt.ItemDataRole.UserRole) != destination.key:
+            raise RuntimeError(f"Workspace sidebar destination is missing or out of order: {destination.key}")
+        item.setIcon(workspace_icon(destination.icon, QApplication.palette()))
+    for key, button in cards:
+        destination = destination_for_key(key)
+        icon = button.findChild(QLabel, "overview" + key.title() + "Icon")
+        if icon is None:
+            raise RuntimeError(f"Workspace overview card icon is missing: {key}")
+        mode = QIcon.Mode.Normal if button.isEnabled() else QIcon.Mode.Disabled
+        icon.setPixmap(workspace_icon(destination.icon, QApplication.palette()).pixmap(
+            QSize(24, 24), icon.devicePixelRatioF(), mode, QIcon.State.Off,
+        ))
 
 
 def overview_page(parent: QWidget) -> tuple[QScrollArea, tuple[tuple[Destination, QPushButton], ...]]:

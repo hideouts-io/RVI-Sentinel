@@ -36,7 +36,7 @@ jobs:
       - name: Install the real saved-file decoder
         run: brew install wireshark
       - name: Validate Python modules
-        run: venv/bin/python -m py_compile analyze.py analyze_preview.py analyze_reviewed.py analyze_captured.py analysis_baseline.py packet_models.py pcapng_process.py saved_capture.py captured_dns.py dns_sessions.py dns_view.py capture_models.py capture_devices.py capture_session.py capture_receipt.py capture_stats.py capture_mobile.py gui.py gui_shell.py gui_models.py packet_timeline.py packet_view.py packet_sessions.py session_view.py report_loader.py enrich_endpoints.py local_endpoint_enrichment.py finding_enrichment.py
+        run: venv/bin/python -m py_compile analyze.py analyze_preview.py analyze_reviewed.py analyze_captured.py analysis_baseline.py packet_models.py pcapng_process.py saved_capture.py captured_dns.py dns_sessions.py dns_view.py capture_models.py capture_devices.py capture_session.py capture_receipt.py capture_stats.py capture_mobile.py gui.py gui_shell.py gui_icons.py gui_models.py packet_timeline.py packet_view.py packet_sessions.py session_view.py report_loader.py enrich_endpoints.py local_endpoint_enrichment.py finding_enrichment.py
       - name: Run deterministic analyzer and model tests
         run: |
           venv/bin/python tests/test_analyzer.py

@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import unicodedata
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QProcess, Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtCore import QEvent, QPoint, QProcess, QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QPixmap
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QGroupBox, QLabel, QLineEdit, QListWidget,
@@ -48,6 +53,45 @@ def selected_destination(sidebar: QListWidget) -> str:
     return key
 
 
+def icon_palette(template: QPalette, background: QColor, foreground: QColor,
+                 highlight: QColor, highlighted_foreground: QColor) -> QPalette:
+    """Exercise Qt palette roles in the owned app without changing OS settings."""
+    palette = QPalette(template)
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive, QPalette.ColorGroup.Disabled):
+        for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base, QPalette.ColorRole.AlternateBase, QPalette.ColorRole.Button):
+            palette.setColor(group, role, background)
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+            palette.setColor(group, role, foreground)
+        palette.setColor(group, QPalette.ColorRole.Highlight, highlight)
+        palette.setColor(group, QPalette.ColorRole.HighlightedText, highlighted_foreground)
+    return palette
+
+
+@contextmanager
+def inherited_legacy_output_encoding() -> Iterator[None]:
+    """Restore the inherited process setting even when actual GUI preview fails."""
+    previous = os.environ.get("PYTHONIOENCODING")
+    os.environ["PYTHONIOENCODING"] = "cp1252"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PYTHONIOENCODING", None)
+        else:
+            os.environ["PYTHONIOENCODING"] = previous
+
+
+def icon_has_foreground(icon: QIcon, foreground: QColor) -> bool:
+    """Wait for rendered palette changes rather than an implementation timer."""
+    image = icon.pixmap(QSize(18, 18), 1.0, QIcon.Mode.Normal, QIcon.State.Off).toImage()
+    return any(
+        color.alpha() >= 224 and abs(color.red() - foreground.red()) <= 2 and
+        abs(color.green() - foreground.green()) <= 2 and abs(color.blue() - foreground.blue()) <= 2
+        for y in range(image.height()) for x in range(image.width())
+        for color in (image.pixelColor(x, y),)
+    )
+
+
 class GuiShellIntegrationTests(unittest.TestCase):
     application: QApplication
 
@@ -62,10 +106,10 @@ class GuiShellIntegrationTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="rvi-sentinel-shell-gui-")
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
-        self.baseline = self.directory / "baseline<literal>.json"
+        self.baseline = self.directory / "baseline & café.json"
         self.baseline.write_text(json.dumps(load_baseline(self.baseline), sort_keys=True), encoding="utf-8")
-        self.exports = self.directory / "exports<literal>"
-        self.capture = self.directory / "authorized<saved>.pcapng"
+        self.exports = self.directory / "exports & café"
+        self.capture = self.directory / "authorized & 案件 café.pcapng"
         self.capture.write_bytes(dns_capture("pcapng"))
         document = analyze(self.capture, load_baseline(self.baseline), 3.8)
         self.report_path = write_report(document, self.capture, self.exports)
@@ -103,31 +147,227 @@ class GuiShellIntegrationTests(unittest.TestCase):
         QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, rectangle.center(), 0)
         wait_until(lambda: selected_destination(sidebar) == destination, 5_000, "Sidebar route selection")
 
-    def test_sidebar_routes_preserve_evidence_without_starting_operations(self) -> None:
+    def assert_icon_rendering(self, pixmap: QPixmap, logical_size: int, device_pixel_ratio: float,
+                              background: QColor, palette_alpha: int) -> bytes:
+        """Inspect alpha-relative stroke coverage and actual composited contrast."""
+        self.assertFalse(pixmap.isNull(), "A semantic workspace icon must produce a real Qt pixmap.")
+        self.assertEqual(pixmap.devicePixelRatio(), device_pixel_ratio)
+        image = pixmap.toImage()
+        physical_size = round(logical_size * device_pixel_ratio)
+        self.assertEqual((image.width(), image.height()), (physical_size, physical_size))
+        self.assertGreater(palette_alpha, 0, "Readable palette ink cannot be fully transparent.")
+        self.assertLessEqual(palette_alpha, 255)
+        alpha = bytes(image.pixelColor(x, y).alpha() for y in range(image.height()) for x in range(image.width()))
+        strong_ink = tuple(image.pixelColor(x, y) for y in range(image.height()) for x in range(image.width())
+                           if image.pixelColor(x, y).alpha() * 255 >= 224 * palette_alpha)
+        self.assertGreaterEqual(len(strong_ink), logical_size // 2, "Readable vector strokes must survive small-scale rasterization.")
+        for color in strong_ink:
+            opacity = color.alphaF()
+            composite = QColor.fromRgbF(
+                color.redF() * opacity + background.redF() * (1 - opacity),
+                color.greenF() * opacity + background.greenF() * (1 - opacity),
+                color.blueF() * opacity + background.blueF() * (1 - opacity),
+            )
+            self.assertGreaterEqual(text_contrast(composite, background), 3.0, "Visible icon strokes must contrast with their displayed background.")
+        for position in range(physical_size):
+            for x, y in ((position, 0), (position, physical_size - 1), (0, position), (physical_size - 1, position)):
+                self.assertEqual(image.pixelColor(x, y).alpha(), 0, "The glyph must retain padding rather than clip at an icon edge.")
+        return alpha
+
+    def rendered_background(self, image: QImage, widget: QWidget, window: RviSentinelWindow,
+                            point: QPoint) -> QColor:
+        """Use the visible composite rather than a transparent widget's palette."""
+        self.assertTrue(widget.rect().contains(point))
+        position = widget.mapTo(window, point)
+        scale = image.devicePixelRatio()
+        pixel = QPoint(round(position.x() * scale), round(position.y() * scale))
+        self.assertTrue(image.rect().contains(pixel))
+        return image.pixelColor(pixel)
+
+    def assert_rendered_background(self, image: QImage, widget: QWidget, window: RviSentinelWindow,
+                                   point: QPoint, expected: QColor) -> QColor:
+        actual = self.rendered_background(image, widget, window, point)
+        for channel in (QColor.red, QColor.green, QColor.blue):
+            self.assertLessEqual(abs(channel(actual) - channel(expected)), 2,
+                                 "The displayed workspace backdrop must adopt the application palette.")
+        return actual
+
+    def test_semantic_workspace_icons_render_at_sidebar_card_scales_and_follow_palette(self) -> None:
+        original_palette = QPalette(self.application.palette())
+        self.addCleanup(self.application.setPalette, original_palette)
         window = self.window()
         sidebar = child(window, QListWidget, "navigationSidebar")
-        stack = child(window, QStackedWidget, "workspaceStack")
-        self.assertEqual(selected_destination(sidebar), "overview")
-        self.assertTrue(child(window, QPushButton, "overviewAnalysisButton").isVisible())
-        self.assertFalse(window.workspace_tabs.tabBar().isVisible())
-        self.assertFalse(window.results_tabs.tabBar().isVisible())
+        destinations: tuple[Destination, ...] = ("overview", "setup", "capture", "analysis", "baselines", "exports", "diagnostics")
+        original_items = tuple(sidebar_item(sidebar, destination) for destination in destinations)
+        original_pages = (window.packet_timeline, window.session_timeline, window.dns_evidence_view)
+        original_navigation = tuple(view.capture_navigation() for view in original_pages)
+        self.application.processEvents()
+        for active_window in (window, None):
+            self.application.setActiveWindow(active_window)
+            self.application.processEvents()
+            wait_until(lambda: not window.icon_refresh_timer.isActive(), 5_000, "Icons refresh after Qt active-window changes")
+            self.assertEqual(window.isActiveWindow(), active_window is window)
+            viewport = sidebar.viewport()
+            selected = sidebar_item(sidebar, "overview")
+            rectangle = sidebar.visualItemRect(selected)
+            rendered_native = window.grab().toImage()
+            native_backgrounds = (
+                (QIcon.Mode.Normal, self.rendered_background(rendered_native, viewport, window, QPoint(4, viewport.height() - 4))),
+                (QIcon.Mode.Selected, self.rendered_background(rendered_native, viewport, window, QPoint(4, rectangle.center().y()))),
+            )
+            for mode, background in native_backgrounds:
+                role = QPalette.ColorRole.Text if mode == QIcon.Mode.Normal else QPalette.ColorRole.HighlightedText
+                foreground_alpha = self.application.palette().color(role).alpha()
+                for item in original_items:
+                    with self.subTest(native_active=window.isActiveWindow(), destination=item.data(Qt.ItemDataRole.UserRole), mode=mode):
+                        self.assert_icon_rendering(item.icon().pixmap(QSize(18, 18), sidebar.devicePixelRatioF(), mode, QIcon.State.Off),
+                                                   18, sidebar.devicePixelRatioF(), background, foreground_alpha)
+        self.application.setActiveWindow(window)
+        self.application.processEvents()
+        before_dpr = sidebar_item(sidebar, "overview").icon().cacheKey()
+        self.application.sendEvent(window, QEvent(QEvent.Type.DevicePixelRatioChange))
+        self.assertTrue(window.icon_refresh_timer.isActive(), "Qt display-scale events schedule the owned icon refresh.")
+        wait_until(lambda: not window.icon_refresh_timer.isActive() and sidebar_item(sidebar, "overview").icon().cacheKey() != before_dpr,
+                   5_000, "Native Qt display-scale event refreshes existing semantic icon values")
+        palettes = (
+            icon_palette(original_palette, QColor("#f5f6f8"), QColor("#1b2028"), QColor("#24578b"), QColor("#ffffff")),
+            icon_palette(original_palette, QColor("#222831"), QColor("#edf2f8"), QColor("#91c8ff"), QColor("#152333")),
+        )
+        for palette in palettes:
+            self.application.setPalette(palette)
+            self.application.processEvents()
+            wait_until(lambda: icon_has_foreground(sidebar_item(sidebar, "overview").icon(), palette.color(QPalette.ColorRole.Text)),
+                       5_000, "Existing semantic icons adopt the actual application palette")
+            self.assertEqual(selected_destination(sidebar), "overview")
+            for before, destination in zip(original_items, destinations, strict=True):
+                self.assertIs(sidebar_item(sidebar, destination), before, "Palette changes must update existing navigation items.")
+            rendered_window = window.grab().toImage()
+            self.assertFalse(rendered_window.isNull())
+            viewport = sidebar.viewport()
+            normal_background = self.assert_rendered_background(
+                rendered_window, viewport, window, QPoint(4, viewport.height() - 4),
+                palette.color(QPalette.ColorRole.AlternateBase),
+            )
+            selection = sidebar.visualItemRect(sidebar_item(sidebar, "overview"))
+            selected_background = self.assert_rendered_background(
+                rendered_window, viewport, window, QPoint(4, selection.center().y()),
+                palette.color(QPalette.ColorRole.Highlight),
+            )
+            for logical_size in (18, 24):
+                for device_pixel_ratio in (1.0, 2.0):
+                    for mode, background in ((QIcon.Mode.Normal, normal_background), (QIcon.Mode.Selected, selected_background)):
+                        with self.subTest(background=palette.color(QPalette.ColorRole.Base).name(), size=logical_size,
+                                          dpr=device_pixel_ratio, mode=mode):
+                            signatures = tuple(self.assert_icon_rendering(
+                                sidebar_item(sidebar, destination).icon().pixmap(QSize(logical_size, logical_size), device_pixel_ratio, mode, QIcon.State.Off),
+                                logical_size, device_pixel_ratio, background, 255,
+                            ) for destination in destinations)
+                            self.assertEqual(len(set(signatures)), len(destinations), "Every workspace needs a distinct visible glyph at each requested scale.")
+            card_signatures: list[bytes] = []
+            for destination in destinations[1:]:
+                label = child(window, QLabel, "overview" + destination.title() + "Icon")
+                card = child(window, QPushButton, "overview" + destination.title() + "Button")
+                self.assertTrue(label.isVisible())
+                self.assertTrue(label.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
+                background = self.assert_rendered_background(
+                    rendered_window, card, window, QPoint(card.width() // 2, 4),
+                    palette.color(QPalette.ColorRole.Base),
+                )
+                foreground_alpha = (self.application.palette().color(QPalette.ColorRole.Text).alpha() if card.isEnabled() else
+                                    self.application.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text).alpha())
+                card_signatures.append(self.assert_icon_rendering(label.pixmap(), 24, label.devicePixelRatioF(), background, foreground_alpha))
+            self.assertEqual(len(set(card_signatures)), len(card_signatures), "Overview cards retain distinct readable semantic icons.")
+            self.click_destination(window, "analysis")
+            self.assertEqual((window.packet_timeline, window.session_timeline, window.dns_evidence_view), original_pages)
+            self.assertEqual(tuple(view.capture_navigation() for view in original_pages), original_navigation)
+            self.click_destination(window, "overview")
+        differential = icon_palette(original_palette, QColor("#f5f6f8"), QColor("#1b2028"), QColor("#24578b"), QColor("#ffffff"))
+        differential.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Highlight, QColor("#c8ddfa"))
+        differential.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.HighlightedText, QColor("#152333"))
+        self.application.setPalette(differential)
+        self.application.processEvents()
+        wait_until(lambda: icon_has_foreground(sidebar_item(sidebar, "overview").icon(), differential.color(QPalette.ColorRole.Text)),
+                   5_000, "Differential palette reaches actual existing icons")
+        for active_window in (window, None):
+            self.application.setActiveWindow(active_window)
+            self.application.processEvents()
+            wait_until(lambda: not window.icon_refresh_timer.isActive(), 5_000, "Differential active-window palette refresh")
+            self.assertEqual(window.isActiveWindow(), active_window is window)
+            selected = sidebar_item(sidebar, "overview")
+            rectangle = sidebar.visualItemRect(selected)
+            background = self.rendered_background(window.grab().toImage(), sidebar.viewport(), window, QPoint(4, rectangle.center().y()))
+            for item in original_items:
+                with self.subTest(differential_active=window.isActiveWindow(), destination=item.data(Qt.ItemDataRole.UserRole)):
+                    self.assert_icon_rendering(item.icon().pixmap(QSize(18, 18), sidebar.devicePixelRatioF(), QIcon.Mode.Selected, QIcon.State.Off),
+                                               18, sidebar.devicePixelRatioF(), background, 255)
+        self.application.setActiveWindow(window)
+        self.application.processEvents()
+        self.assertEqual(tuple(sidebar_item(sidebar, destination) for destination in destinations), original_items)
+        self.assertEqual((window.packet_timeline, window.session_timeline, window.dns_evidence_view), original_pages)
+        self.assertEqual(tuple(view.capture_navigation() for view in original_pages), original_navigation)
+        script = """
+import gc
+from PySide6.QtCore import QSize
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication
+from gui_icons import workspace_icon
 
-        window.show_destination("analysis")
-        original_baseline = self.baseline.read_bytes()
-        window.start_analysis()
-        wait_until(lambda: window.process.state() == QProcess.ProcessState.NotRunning and not window.report_loading and
-                   window.packet_timeline.completed_page is not None,
-                   30_000, "Real passive preview and report loading")
-        self.wait_views(window)
-        wait_until(lambda: window.enrichment_process.state() == QProcess.ProcessState.NotRunning,
-                   10_000, "Local endpoint context without PTR")
-        self.assertEqual(window.process.exitCode(), 0)
-        self.assertIsNotNone(window.preview_sha256)
-        self.assertTrue(window.add_to_baseline_button.isEnabled(), "The reviewed update action is available before navigation.")
-        self.assertEqual(self.baseline.read_bytes(), original_baseline)
+app = QApplication(['workspace-icon-copy-lifetime'])
+completed = 0
+for key in ('overview', 'setup', 'capture', 'analysis', 'baselines', 'exports', 'diagnostics'):
+    original = workspace_icon(key, app.palette())
+    before = original.pixmap(QSize(18, 18), 2.0, QIcon.Mode.Normal, QIcon.State.Off).toImage()
+    copied = QIcon(original)
+    copied.addPixmap(original.pixmap(QSize(24, 24), 2.0, QIcon.Mode.Normal, QIcon.State.Off), QIcon.Mode.Disabled, QIcon.State.Off)
+    gc.collect()
+    assert original.pixmap(QSize(18, 18), 2.0, QIcon.Mode.Normal, QIcon.State.Off).toImage() == before
+    del original
+    gc.collect()
+    assert not copied.pixmap(QSize(18, 18), 2.0, QIcon.Mode.Normal, QIcon.State.Off).isNull()
+    completed += 1
+print(completed)
+"""
+        result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", script],
+                                cwd=Path(__file__).resolve().parent.parent, env=os.environ.copy(),
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, "Actual Qt icon copy/detachment lifetime failed: " + result.stderr[-2048:])
+        self.assertEqual(result.stdout.strip(), "7", "Every semantic icon survives native Qt value copying and detachment.")
+
+    def test_sidebar_routes_preserve_evidence_without_starting_operations(self) -> None:
+        with inherited_legacy_output_encoding():
+            window = self.window()
+            sidebar = child(window, QListWidget, "navigationSidebar")
+            stack = child(window, QStackedWidget, "workspaceStack")
+            self.assertEqual(selected_destination(sidebar), "overview")
+            self.assertTrue(child(window, QPushButton, "overviewAnalysisButton").isVisible())
+            self.assertFalse(window.workspace_tabs.tabBar().isVisible())
+            self.assertFalse(window.results_tabs.tabBar().isVisible())
+
+            window.show_destination("analysis")
+            original_baseline = self.baseline.read_bytes()
+            window.start_analysis()
+            wait_until(lambda: window.process.state() == QProcess.ProcessState.NotRunning and not window.report_loading and
+                       window.packet_timeline.completed_page is not None,
+                       30_000, "Real Unicode passive preview and report loading under inherited CP1252")
+            self.wait_views(window)
+            wait_until(lambda: window.enrichment_process.state() == QProcess.ProcessState.NotRunning,
+                       10_000, "Local endpoint context without PTR")
+            self.assertEqual(window.process.exitCode(), 0)
+            self.assertIsNotNone(window.preview_sha256)
+            self.assertTrue(window.add_to_baseline_button.isEnabled(), "The reviewed update action is available before navigation.")
+            self.assertEqual(self.baseline.read_bytes(), original_baseline)
+            self.assertEqual(window.active_report_path, self.report_path.resolve())
+            self.assertIn(unicodedata.normalize("NFC", str(self.report_path.resolve())),
+                          unicodedata.normalize("NFC", window.console.toPlainText()))
+            self.assertNotIn("\ufffd", window.console.toPlainText())
+            self.assertEqual(os.environ.get("PYTHONIOENCODING"), "cp1252", "The owned child environment must not mutate its parent's setting.")
         packets, sessions, dns = window.packet_timeline, window.session_timeline, window.dns_evidence_view
         reviewed_report = packets.report
         self.assertIsNotNone(reviewed_report)
+        if reviewed_report is None:
+            raise AssertionError("The real Unicode preview did not load its complete saved report.")
+        self.assertEqual(unicodedata.normalize("NFC", reviewed_report.capture.path),
+                         unicodedata.normalize("NFC", str(self.capture.resolve())))
         for view, identifier, value in (
             (packets, "packetProtocolFilter", "udp"),
             (sessions, "sessionPortFilter", "54000"),
@@ -189,6 +429,21 @@ class GuiShellIntegrationTests(unittest.TestCase):
             self.assertEqual(spy.count(), 0, f"Navigation unexpectedly started {name}.")
         self.assertEqual({path: path.read_bytes() for path in saved_bytes}, saved_bytes)
         self.assertEqual(set(self.exports.iterdir()), {path for path in saved_bytes if path.parent == self.exports})
+        self.assertTrue(window.add_to_baseline_button.isEnabled(), "Navigation preserves the verified reviewed update action.")
+        try:
+            for field, identifier, value in (
+                (window.baseline_field, "baselinePath", "<b>literal & baseline</b>"),
+                (window.export_field, "exportPath", "<i>literal & exports</i>"),
+            ):
+                field.setText(value)
+                label = child(window, QLabel, identifier)
+                self.assertEqual(label.text(), value)
+                self.assertEqual(label.textFormat(), Qt.TextFormat.PlainText)
+            self.assertIsNone(window.preview_sha256, "Changed request fields revoke the previous reviewed digest.")
+            self.assertEqual({path: path.read_bytes() for path in saved_bytes}, saved_bytes)
+        finally:
+            window.baseline_field.setText(str(self.baseline))
+            window.export_field.setText(str(self.exports))
 
     def test_programmatic_routes_and_dns_sources_sync_without_recreating_views(self) -> None:
         window = self.window()

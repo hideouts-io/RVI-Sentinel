@@ -61,7 +61,7 @@ from PySide6.QtWidgets import (
 
 from gui_shell import (
     DESTINATIONS, Destination, destination_for_key, overview_page, plain_label,
-    populate_sidebar, scroll_page, shell_stylesheet,
+    populate_sidebar, refresh_workspace_icons, scroll_page, shell_stylesheet,
 )
 from gui_models import (
     AnalysisReport,
@@ -131,6 +131,19 @@ DEFAULT_EXPORT_DIRECTORY = ROOT / "exports"
 DEFAULT_CAPTURE_DIRECTORY = ROOT / "captures"
 APP_ICON = ROOT / "assets" / "rvi-sentinel-app-icon.png"
 GUI_INSTANCE_LOCK = Path(tempfile.gettempdir()) / "rvi-sentinel-gui.lock"
+
+
+def python_helper_environment() -> QProcessEnvironment:
+    """Match owned Python pipes to the GUI's UTF-8 text protocol on every host.
+
+    Windows redirected Python streams otherwise use the ANSI locale encoding.
+    This creates a child environment without changing the application's process
+    environment or binary decoder inputs.
+    """
+    environment = QProcessEnvironment.systemEnvironment()
+    environment.insert("PYTHONUNBUFFERED", "1")
+    environment.insert("PYTHONIOENCODING", "utf-8")
+    return environment
 
 
 def passive_analysis_arguments(
@@ -339,7 +352,12 @@ class RviSentinelWindow(QMainWindow):
     """Main capture and analysis window backed by the existing CLI tools."""
 
     def __init__(self) -> None:
+        self._workspace_icons_ready: bool = False
         super().__init__()
+        self.icon_refresh_timer = QTimer(self)
+        self.icon_refresh_timer.setSingleShot(True)
+        self.icon_refresh_timer.timeout.connect(self.refresh_icons)
+        self._workspace_palette_key: int = QApplication.palette().cacheKey()
         self.process = QProcess(self)
         self.enrichment_process = QProcess(self)
         self.device_process = QProcess(self)
@@ -392,6 +410,7 @@ class RviSentinelWindow(QMainWindow):
         self.report_loading = False
         self.closing_requested = False
         self.quit_requested = False
+        self.overview_cards: tuple[tuple[Destination, QPushButton], ...] = ()
         self.navigation_sidebar = QListWidget()
         self.detail_stack = QStackedWidget()
         self.result_selector = QComboBox()
@@ -537,6 +556,7 @@ class RviSentinelWindow(QMainWindow):
         detail_layout.addLayout(header)
         self.detail_stack.setObjectName("workspaceStack")
         overview, cards = overview_page(detail)
+        self.overview_cards = cards
         self.shortcut_pages["overview"] = overview
         self.detail_stack.addWidget(overview)
         for key, button in cards:
@@ -562,6 +582,36 @@ class RviSentinelWindow(QMainWindow):
         self.result_selector.currentIndexChanged.connect(self.select_result)
         self.refresh_result_selector()
         self.show_destination("overview")
+        self._workspace_icons_ready = True
+        self.refresh_icons()
+
+    def changeEvent(self, event: QEvent) -> None:
+        """Coalesce icon refresh until Qt has propagated palette and display changes."""
+        super().changeEvent(event)
+        if self._workspace_icons_ready and not self.closing_requested and event.type() in (
+            QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.StyleChange,
+            QEvent.Type.ActivationChange, QEvent.Type.EnabledChange,
+        ):
+            self.icon_refresh_timer.start(0)
+
+    def event(self, event: QEvent) -> bool:
+        """Refresh fixed card pixmaps after Qt applies a new display scale."""
+        handled = super().event(event)
+        if (self._workspace_icons_ready and not self.closing_requested
+                and event.type() == QEvent.Type.DevicePixelRatioChange):
+            self.icon_refresh_timer.start(0)
+        return handled
+
+    @Slot()
+    def refresh_icons(self) -> None:
+        """Preserve sidebar items and evidence widgets when recoloring the glyphs."""
+        palette_key = QApplication.palette().cacheKey()
+        if palette_key != self._workspace_palette_key:
+            self._workspace_palette_key = palette_key
+            # Qt stylesheet palette roles must be repolished after theme changes.
+            self.setStyleSheet(self.styleSheet())
+        refresh_workspace_icons(self.navigation_sidebar, self.overview_cards)
 
     def create_shortcut_page(self, key: Destination) -> QWidget:
         """Expose current local choices and reuse explicit existing workflow actions."""
@@ -1148,6 +1198,7 @@ class RviSentinelWindow(QMainWindow):
         self.check_button.setEnabled(False)
         self.check_status.setText("Checking this computer and the selected phone…")
         self.check_process.setWorkingDirectory(str(ROOT))
+        self.check_process.setProcessEnvironment(python_helper_environment())
         self.check_process.setProgram(sys.executable)
         self.check_process.setArguments(arguments)
         self.check_process.start()
@@ -1196,10 +1247,8 @@ class RviSentinelWindow(QMainWindow):
         if self.completed_capture_path is None:
             self.capture_status_label.setText("Looking for physical iPhone and iPad devices…")
         self.capture_console.append(f"$ {shlex.join([sys.executable, str(DEVICE_DISCOVERY)])}")
-        environment = QProcessEnvironment.systemEnvironment()
-        environment.insert("PYTHONUNBUFFERED", "1")
-        self.device_process.setProcessEnvironment(environment)
         self.device_process.setWorkingDirectory(str(ROOT))
+        self.device_process.setProcessEnvironment(python_helper_environment())
         self.device_process.setProgram(sys.executable)
         self.device_process.setArguments([str(DEVICE_DISCOVERY)])
         self.device_process.start()
@@ -1306,10 +1355,8 @@ class RviSentinelWindow(QMainWindow):
         self.refresh_devices_button.setEnabled(False)
         self.new_capture_button.setEnabled(False)
         self.cancel_capture_button.setEnabled(True)
-        environment = QProcessEnvironment.systemEnvironment()
-        environment.insert("PYTHONUNBUFFERED", "1")
-        self.capture_process.setProcessEnvironment(environment)
         self.capture_process.setWorkingDirectory(str(ROOT))
+        self.capture_process.setProcessEnvironment(python_helper_environment())
         self.capture_process.setProgram(sys.executable)
         self.capture_process.setArguments(session_arguments)
         self.capture_process.start()
@@ -1619,10 +1666,8 @@ class RviSentinelWindow(QMainWindow):
         )
         self.install_capture_support_button.setEnabled(False)
         self.capture_status_label.setText("Installing the upstream capture backend locally…")
-        environment = QProcessEnvironment.systemEnvironment()
-        environment.insert("PYTHONUNBUFFERED", "1")
-        self.setup_process.setProcessEnvironment(environment)
         self.setup_process.setWorkingDirectory(str(ROOT))
+        self.setup_process.setProcessEnvironment(python_helper_environment())
         self.setup_process.setProgram(sys.executable)
         self.setup_process.setArguments([str(CAPTURE_SUPPORT_SETUP)])
         self.setup_process.start()
@@ -1803,10 +1848,8 @@ class RviSentinelWindow(QMainWindow):
         self.analyze_button.setEnabled(False)
         self.cancel_analysis_button.setEnabled(True)
 
-        environment = QProcessEnvironment.systemEnvironment()
-        environment.insert("PYTHONUNBUFFERED", "1")
-        self.process.setProcessEnvironment(environment)
         self.process.setWorkingDirectory(str(ROOT))
+        self.process.setProcessEnvironment(python_helper_environment())
         self.process.setProgram(sys.executable)
         self.process.setArguments(arguments)
         self.process.start()
@@ -1874,6 +1917,7 @@ class RviSentinelWindow(QMainWindow):
         self.console.append("\nAdding findings to the selected baseline…\n")
         self.status_label.setText("Updating the selected baseline…")
         self.process.setWorkingDirectory(str(ROOT))
+        self.process.setProcessEnvironment(python_helper_environment())
         self.process.setProgram(sys.executable)
         self.process.setArguments(arguments)
         self.process.start()
@@ -2460,6 +2504,7 @@ class RviSentinelWindow(QMainWindow):
         self.add_to_baseline_button.setEnabled(False)
         self.cancel_enrichment_button.setEnabled(True)
         self.enrichment_process.setWorkingDirectory(str(ROOT))
+        self.enrichment_process.setProcessEnvironment(python_helper_environment())
         self.enrichment_process.setProgram(sys.executable)
         self.enrichment_process.setArguments(arguments)
         self.enrichment_process.start()
@@ -2691,6 +2736,7 @@ class RviSentinelWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.closing_requested = True
+        self.icon_refresh_timer.stop()
         self.cancel_report_loading()
         packet_stopped = self.packet_timeline.shutdown()
         session_stopped = self.session_timeline.shutdown()
