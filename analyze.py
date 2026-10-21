@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-import ipaddress
 import json
 import math
 import os
+import re
 import signal
+import stat
 import sys
 import threading
 import tempfile
@@ -28,7 +29,8 @@ from analysis_baseline import (
     updated_endpoints,
     updated_tls_sni,
 )
-from packet_models import PacketDocument, PacketTimestamp, packet_document, packet_values
+from analysis_observations import PacketObservationCancelled, summarize_packet_observations
+from packet_models import PacketDocument, PacketTimestamp, packet_document
 from captured_dns import DnsEvidenceDocument, dns_evidence_document
 from saved_capture import SAVED_ANALYSIS_LIMITS, SavedAnalysisLimits, SavedCaptureError, read_saved_capture
 
@@ -128,46 +130,21 @@ def analyze_capture(pcap: Path, baseline: BaselineDocument, entropy_threshold: f
     if not math.isfinite(entropy_threshold) or not 0.0 <= entropy_threshold <= 8.0:
         raise ValueError("Entropy threshold must be a finite number between 0.0 and 8.0.")
     decoded = read_saved_capture(pcap, limits, cancellation)
-    endpoints: Counter[str] = Counter()
-    domains: Counter[str] = Counter()
-    sni: Counter[str] = Counter()
-    protocols: Counter[str] = Counter()
-    ports: Counter[str] = Counter()
-    transport_ports: Counter[tuple[str, str]] = Counter()
+    try:
+        observations = summarize_packet_observations(decoded.packets, cancellation)
+    except PacketObservationCancelled as error:
+        raise SavedCaptureError("cancelled", "Saved-file analysis was cancelled; no completed report or baseline update was produced.") from error
     suspicious_dns: dict[str, EntropyDocument] = {}
-    quic_like = 0
-    for record in decoded.packets:
+    for domain, _count in observations.domains:
         if cancellation.is_set():
             raise SavedCaptureError("cancelled", "Saved-file analysis was cancelled; no completed report or baseline update was produced.")
-        for field in ("ip.src", "ip.dst", "ipv6.src", "ipv6.dst"):
-            endpoints.update(str(ipaddress.ip_address(value)) for value in packet_values(record, field))
-        protocol_values = packet_values(record, "_ws.col.Protocol")
-        protocol = protocol_values[0]
-        protocols[protocol] += 1
-        for transport, fields in (("tcp", ("tcp.srcport", "tcp.dstport")), ("udp", ("udp.srcport", "udp.dstport"))):
-            for field in fields:
-                for value in packet_values(record, field):
-                    port = str(int(value))
-                    ports[port] += 1
-                    transport_ports[(transport, port)] += 1
-        udp_ports = packet_values(record, "udp.srcport") + packet_values(record, "udp.dstport")
-        if "443" in udp_ports or "QUIC" in protocol.upper():
-            quic_like += 1
-        for value in packet_values(record, "dns.qry.name"):
-            domain = value.strip().lower().rstrip(".")
-            if domain:
-                domains[domain] += 1
-                score, label = dns_entropy(domain)
-                if score >= entropy_threshold and len(label) >= 12:
-                    suspicious_dns[domain] = {
-                        "max_label": label,
-                        "entropy": round(score, 3),
-                        "note": "Heuristic only; legitimate generated/CDN names can score highly.",
-                    }
-        for value in packet_values(record, "tls.handshake.extensions_server_name"):
-            host = value.strip().lower().rstrip(".")
-            if host:
-                sni[host] += 1
+        score, label = dns_entropy(domain)
+        if score >= entropy_threshold and len(label) >= 12:
+            suspicious_dns[domain] = {
+                "max_label": label,
+                "entropy": round(score, 3),
+                "note": "Heuristic only; legitimate generated/CDN names can score highly.",
+            }
     first = min((packet.timestamp for packet in decoded.packets), key=lambda epoch: (epoch.seconds, epoch.nanoseconds))
     last = max((packet.timestamp for packet in decoded.packets), key=lambda epoch: (epoch.seconds, epoch.nanoseconds))
     duration_nanoseconds = (last.seconds - first.seconds) * 1_000_000_000 + last.nanoseconds - first.nanoseconds
@@ -198,20 +175,20 @@ def analyze_capture(pcap: Path, baseline: BaselineDocument, entropy_threshold: f
         "packets": [packet_document(packet) for packet in decoded.packets],
         "dns_evidence": dns_evidence_document(decoded.dns_evidence),
         "summary": {
-            "unique_endpoints": len(endpoints),
-            "unique_dns_queries": len(domains),
-            "unique_tls_sni": len(sni),
-            "quic_like_packets": quic_like,
-            "new_endpoints": sorted(set(endpoints) - set(baseline["endpoints"])),
-            "new_domains": sorted(set(domains) - set(baseline["domains"])),
-            "new_tls_sni": sorted(set(sni) - set(baseline["tls_sni"])),
+            "unique_endpoints": len(observations.endpoints),
+            "unique_dns_queries": len(observations.domains),
+            "unique_tls_sni": len(observations.tls_sni),
+            "quic_like_packets": observations.quic_like_packets,
+            "new_endpoints": sorted({name for name, _count in observations.endpoints} - set(baseline["endpoints"])),
+            "new_domains": sorted({name for name, _count in observations.domains} - set(baseline["domains"])),
+            "new_tls_sni": sorted({name for name, _count in observations.tls_sni} - set(baseline["tls_sni"])),
         },
-        "top_endpoints": endpoints.most_common(),
-        "top_domains": domains.most_common(),
-        "top_tls_sni": sni.most_common(),
-        "top_protocols": protocols.most_common(),
-        "top_ports": ports.most_common(),
-        "top_transport_ports": [(transport, port, count) for (transport, port), count in transport_ports.most_common()],
+        "top_endpoints": list(observations.endpoints),
+        "top_domains": list(observations.domains),
+        "top_tls_sni": list(observations.tls_sni),
+        "top_protocols": list(observations.protocols),
+        "top_ports": list(observations.ports),
+        "top_transport_ports": list(observations.transport_ports),
         "dns_entropy_findings": suspicious_dns,
     }
 
@@ -250,7 +227,73 @@ def write_report(report: ReportDocument, pcap: Path, export_dir: Path) -> Path:
 
 def report_destinations(pcap: Path, export_dir: Path) -> tuple[Path, ...]:
     stem = pcap.stem
-    return tuple(export_dir / f"{stem}_{suffix}" for suffix in ("report.json", "endpoints.csv", "dns.csv", "tls_sni.csv"))
+    return tuple(export_dir / f"{stem}_{suffix}" for suffix in ("report.json", "endpoints.csv", "dns.csv", "tls_sni.csv", "capture.sha256"))
+
+
+def export_receipt_digest(path: Path) -> str | None:
+    """Read a bounded, stable regular ownership receipt without following links."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SavedCaptureError("invalid_export_receipt", "Could not safely read the export ownership receipt. Choose a separate export directory; existing outputs were not replaced.") from error
+    with os.fdopen(descriptor, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size != 65:
+            raise SavedCaptureError("invalid_export_receipt", "The export ownership receipt is not a regular 65-byte SHA-256 receipt. Choose a separate export directory.")
+        content = stream.read(66)
+        after = os.fstat(stream.fileno())
+        current = path.lstat()
+    identities = tuple((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) for info in (before, after, current))
+    if not stat.S_ISREG(current.st_mode) or len(set(identities)) != 1 or re.fullmatch(rb"[0-9a-f]{64}\n", content) is None:
+        raise SavedCaptureError("invalid_export_receipt", "The export ownership receipt is invalid or changed while reading. Choose a separate export directory.")
+    return content[:-1].decode("ascii")
+
+
+def require_export_owner(receipt: Path, capture_sha256: str) -> None:
+    """Require the claimed bundle to remain bound to this capture before publication."""
+    owner = export_receipt_digest(receipt)
+    if owner is None:
+        raise SavedCaptureError("invalid_export_receipt", "The export ownership receipt disappeared before publication. Choose a separate export directory.")
+    if owner != capture_sha256:
+        raise SavedCaptureError("export_capture_collision", "These export names belong to a different capture. Choose a separate export directory; existing outputs were not replaced.")
+
+
+def validate_export_bundle(destinations: tuple[Path, ...], capture_sha256: str) -> None:
+    """Refuse foreign or unclaimed outputs rather than infer ownership from filenames."""
+    if re.fullmatch(r"[0-9a-f]{64}", capture_sha256) is None:
+        raise SavedCaptureError("invalid_capture_digest", "Export publication requires a valid capture SHA-256.")
+    owner = export_receipt_digest(destinations[4])
+    if owner is None:
+        if any(path.exists() for path in destinations[:4]):
+            raise SavedCaptureError("unclaimed_export_bundle", "Existing export files have no capture ownership receipt. Choose a separate export directory; existing outputs were not replaced.")
+    elif owner != capture_sha256:
+        raise SavedCaptureError("export_capture_collision", "These export names belong to a different capture. Choose a separate export directory; existing outputs were not replaced.")
+
+
+def prepare_export_receipt(path: Path, capture_sha256: str) -> None:
+    """Finish the private staged receipt before any ownership name is published."""
+    with path.open("wb") as stream:
+        stream.write((capture_sha256 + "\n").encode("ascii"))
+        stream.flush()
+
+
+def claim_export_bundle(staged_receipt: Path, receipt: Path, capture_sha256: str) -> None:
+    """Publish a complete receipt exclusively, without cleanup of final pathnames."""
+    try:
+        os.link(staged_receipt, receipt, follow_symlinks=False)
+    except FileExistsError:
+        require_export_owner(receipt, capture_sha256)
+        return
+    except OSError as error:
+        raise SavedCaptureError("export_receipt_publication_failed", f"The complete export ownership receipt could not be published exclusively (errno {error.errno}). Choose a writable export directory on a filesystem supporting hard links; existing outputs were not replaced.") from error
+    require_export_owner(receipt, capture_sha256)
 
 
 def paths_alias(first: Path, second: Path) -> bool:
@@ -301,20 +344,27 @@ def prepare_json(path: Path, document: ReportDocument | BaselineDocument, cancel
 
 
 def save_report(report: ReportDocument, pcap: Path, export_dir: Path, protected: tuple[Path, ...], cancellation: threading.Event) -> Path:
+    check_save_cancellation(cancellation)
     destinations = report_destinations(pcap, export_dir)
     validate_destinations(destinations, protected)
+    capture_sha256 = report["capture"]["sha256"]
+    validate_export_bundle(destinations, capture_sha256)
     export_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".rvi-sentinel-report-", dir=export_dir) as temporary:
         staged = tuple(Path(temporary) / destination.name for destination in destinations)
         prepare_json(staged[0], report, cancellation)
-        write_csv(staged[1], ["endpoint", "packets"], report["top_endpoints"])
-        write_csv(staged[2], ["domain", "queries"], report["top_domains"])
+        write_csv(staged[1], ["endpoint", "address_observations"], report["top_endpoints"])
+        write_csv(staged[2], ["domain", "question_observations"], report["top_domains"])
         write_csv(staged[3], ["hostname", "observations"], report["top_tls_sni"])
+        prepare_export_receipt(staged[4], capture_sha256)
         check_save_cancellation(cancellation)
         validate_destinations(destinations, protected)
+        validate_export_bundle(destinations, capture_sha256)
+        claim_export_bundle(staged[4], destinations[4], capture_sha256)
         # The complete JSON report is published last; an individual file is never truncated.
         for index in (1, 2, 3, 0):
             check_save_cancellation(cancellation)
+            require_export_owner(destinations[4], capture_sha256)
             os.replace(staged[index], destinations[index])
     return destinations[0]
 

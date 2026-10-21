@@ -48,7 +48,7 @@ class SessionGuiIntegrationTests(unittest.TestCase):
         self.exports = self.directory / "exports"
 
     def saved_report(self, container: Literal["pcap", "pcapng"]) -> tuple[AnalysisReport, Path, bytes]:
-        capture = self.directory / f"scoped-session.{container}"
+        capture = self.directory / f"scoped-session-{container}.{container}"
         content = session_capture(container)
         capture.write_bytes(content)
         document = analyze(capture, load_baseline(self.baseline), 3.8)
@@ -362,7 +362,7 @@ class SessionGuiIntegrationTests(unittest.TestCase):
 
     def test_application_quit_finishes_actual_owned_session_and_packet_workers(self) -> None:
         self.saved_report("pcapng")
-        report_path = self.exports / "scoped-session_report.json"
+        report_path = self.exports / "scoped-session-pcapng_report.json"
         script = """
 from pathlib import Path
 import hashlib
