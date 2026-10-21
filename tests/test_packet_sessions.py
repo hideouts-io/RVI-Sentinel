@@ -25,12 +25,13 @@ from packet_sessions import (
     query_sessions,
     session_for_identity,
     session_for_packet,
+    session_index_steps,
     ungrouped_for_packet,
     ungrouped_frames,
 )
 from packet_timeline import PacketIdentity, PacketIndex, build_packet_index
 from saved_capture import SAVED_ANALYSIS_LIMITS, read_saved_capture
-from tests.session_fixture import session_capture
+from tests.session_fixture import diverse_session_records, session_capture
 
 CAPTURE_SHA256 = "0123456789abcdef" * 4
 
@@ -258,6 +259,24 @@ class PacketSessionTests(unittest.TestCase):
         with self.assertRaises(SessionCancelled):
             packet_index_for_session(index, index.sessions[0].identity, cancellation)
         self.assertEqual(query_sessions(index, EMPTY_SESSION_QUERY, None, threading.Event()), prior)
+
+    def test_incremental_correlation_returns_only_complete_original_evidence(self) -> None:
+        packets = diverse_session_records(1024)
+        source = build_packet_index(CAPTURE_SHA256, packets, threading.Event())
+        expected = build_session_index(source, threading.Event())
+        completed = tuple(result for result in session_index_steps(source, threading.Event()) if result is not None)
+        self.assertEqual(completed, (expected,))
+        self.assertIs(completed[0].packet_index, source)
+        self.assertIs(members_for_session(completed[0], completed[0].sessions[0].identity)[0], packets[0])
+
+        cancellation = threading.Event()
+        steps = session_index_steps(source, cancellation)
+        self.assertIsNone(next(steps))
+        self.assertIsNone(next(steps))
+        cancellation.set()
+        with self.assertRaises(SessionCancelled):
+            tuple(steps)
+        self.assertEqual(query_sessions(expected, EMPTY_SESSION_QUERY, None, threading.Event()).total_count, 512)
 
 
 class RealSavedSessionTests(unittest.TestCase):

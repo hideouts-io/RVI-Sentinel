@@ -290,15 +290,28 @@ def _ungrouped_reasons(packet: PacketRecord) -> tuple[UngroupedReason, ...]:
 
 
 def _canonical_process(metadata: ProcessMetadata) -> ProcessMetadata:
-    return ProcessMetadata(metadata.state, tuple(sorted(metadata.labels, key=lambda label: (label.source, label.pid if label.pid is not None else -1, label.name if label.name is not None else ""))))
+    if len(metadata.labels) < 2:
+        return metadata
+    labels = tuple(sorted(metadata.labels, key=lambda label: (label.source, label.pid if label.pid is not None else -1, label.name if label.name is not None else "")))
+    return metadata if labels == metadata.labels else ProcessMetadata(metadata.state, labels)
+
+
+def _canonical_interface(metadata: InterfaceMetadata) -> InterfaceMetadata:
+    if len(metadata.labels) < 2:
+        return metadata
+    labels = tuple(sorted(metadata.labels, key=lambda label: (label.source, label.name)))
+    return metadata if labels == metadata.labels else InterfaceMetadata(metadata.state, labels)
 
 
 def _scope(packet: PacketRecord) -> SessionScope:
     if packet.source_address is None or packet.destination_address is None or packet.source_port is None or packet.destination_port is None or packet.transport is None or packet.stream is None:
         raise SessionValidationError("Session scope requires complete unambiguous endpoints, transport and decoder stream.")
-    endpoints = sorted((EndpointScope(str(ipaddress.ip_address(packet.source_address)), packet.source_port), EndpointScope(str(ipaddress.ip_address(packet.destination_address)), packet.destination_port)), key=lambda endpoint: (ipaddress.ip_address(endpoint.address).version, int(ipaddress.ip_address(endpoint.address)), endpoint.port))
-    interface = InterfaceMetadata(packet.interface.state, tuple(sorted(packet.interface.labels, key=lambda label: (label.source, label.name))))
-    return SessionScope(packet.transport, packet.stream, endpoints[0], endpoints[1], _canonical_process(packet.process), _canonical_process(packet.effective_process), interface)
+    source = ipaddress.ip_address(packet.source_address)
+    destination = ipaddress.ip_address(packet.destination_address)
+    source_endpoint = EndpointScope(str(source), packet.source_port)
+    destination_endpoint = EndpointScope(str(destination), packet.destination_port)
+    endpoints = (source_endpoint, destination_endpoint) if (source.version, int(source), packet.source_port) <= (destination.version, int(destination), packet.destination_port) else (destination_endpoint, source_endpoint)
+    return SessionScope(packet.transport, packet.stream, endpoints[0], endpoints[1], _canonical_process(packet.process), _canonical_process(packet.effective_process), _canonical_interface(packet.interface))
 
 
 def _scope_identity(capture_sha256: str, scope: SessionScope) -> SessionIdentity:
@@ -320,6 +333,14 @@ def _scope_estimated_bytes(scope: SessionScope) -> int:
 
 
 def build_session_index(packet_index: PacketIndex, cancellation: threading.Event) -> SessionIndex:
+    """Complete the pure bounded reduction without adding a scheduling policy."""
+    for result in session_index_steps(packet_index, cancellation):
+        if result is not None:
+            return result
+    raise SessionValidationError("Session correlation ended without a complete index.")
+
+
+def session_index_steps(packet_index: PacketIndex, cancellation: threading.Event) -> Iterator[SessionIndex | None]:
     """Partition every frame into one scoped session or one ungrouped result.
 
     Correlation retains at most 200,000 original frame references and applies a
@@ -327,6 +348,8 @@ def build_session_index(packet_index: PacketIndex, cancellation: threading.Event
     than truncating. These ceilings do not measure process RSS. Direction is not
     a grouping key, so reverse traffic joins; conflicting direction metadata
     prevents grouping. Exact timestamp order is inherited from PacketIndex.
+    None marks a bounded batch boundary; the only value is the complete index.
+    The caller owns scheduling between steps. No partial index is published.
     """
     _check_cancelled(cancellation)
     if not isinstance(packet_index, PacketIndex):
@@ -345,6 +368,7 @@ def build_session_index(packet_index: PacketIndex, cancellation: threading.Event
     for position, packet in enumerate(packet_index.packets):
         if position % 256 == 0:
             _check_cancelled(cancellation)
+            yield None
         _validate_record(packet)
         order = (packet.timestamp.seconds, packet.timestamp.nanoseconds, packet.frame_number)
         if packet.frame_number in frames or previous_order is not None and order < previous_order:
@@ -370,6 +394,7 @@ def build_session_index(packet_index: PacketIndex, cancellation: threading.Event
     for position, (frame, source_position) in enumerate(zip(packet_index.frame_numbers, packet_index.frame_positions)):
         if position % 256 == 0:
             _check_cancelled(cancellation)
+            yield None
         if type(frame) is not int or frame <= previous_frame or type(source_position) is not int or not 0 <= source_position < len(packet_index.packets) or packet_index.packets[source_position].frame_number != frame:
             raise SessionValidationError("Session packet frame lookup is inconsistent with saved evidence.")
         previous_frame = frame
@@ -378,6 +403,7 @@ def build_session_index(packet_index: PacketIndex, cancellation: threading.Event
     for position, (scope, members) in enumerate(groups.items()):
         if position % 256 == 0:
             _check_cancelled(cancellation)
+            yield None
         known_lengths = sum(packet.captured_length is not None for packet in members)
         captured_bytes = sum(packet.captured_length for packet in members if packet.captured_length is not None) if known_lengths == len(members) else None
         records.append(SessionRecord(_scope_identity(packet_index.capture_sha256, scope), scope, len(members), members[0].timestamp, members[-1].timestamp, sum(packet.wire_length for packet in members), captured_bytes, known_lengths, tuple(sorted({protocol for packet in members for protocol in packet.protocol_stack})), tuple(packet.frame_number for packet in members)))
@@ -391,7 +417,7 @@ def build_session_index(packet_index: PacketIndex, cancellation: threading.Event
     eligible_count = sum(record.packet_count for record in records)
     if eligible_count + len(ungrouped) != len(packet_index.packets):
         raise SessionValidationError("Session correlation did not partition every original packet exactly once.")
-    return SessionIndex(packet_index.capture_sha256, packet_index, tuple(records), tuple(key for key, _ in keys), tuple(position for _, position in keys), tuple(frame for frame, _ in members), tuple(position for _, position in members), tuple(ungrouped), tuple(frame for frame, _ in ungrouped_keys), tuple(position for _, position in ungrouped_keys), tuple(UngroupedReasonCount(reason, counts[reason]) for reason in UNGROUPED_REASONS if counts[reason]), eligible_count)
+    yield SessionIndex(packet_index.capture_sha256, packet_index, tuple(records), tuple(key for key, _ in keys), tuple(position for _, position in keys), tuple(frame for frame, _ in members), tuple(position for _, position in members), tuple(ungrouped), tuple(frame for frame, _ in ungrouped_keys), tuple(position for _, position in ungrouped_keys), tuple(UngroupedReasonCount(reason, counts[reason]) for reason in UNGROUPED_REASONS if counts[reason]), eligible_count)
 
 
 def session_for_identity(index: SessionIndex, identity: SessionIdentity) -> SessionRecord | None:

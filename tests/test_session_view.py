@@ -356,6 +356,54 @@ class SessionViewTests(unittest.TestCase):
         finally:
             session_view.query_sessions = real_query
 
+    def test_index_worker_cancels_without_a_gui_acknowledgement(self) -> None:
+        request = session_view._JobRequest(1, None, self.report, "a" * 64, session_view.EMPTY_SESSION_QUERY, None, None, None, None)
+        cancellation = Event()
+        entered = Event()
+        outcomes: list[object] = []
+        worker = session_view._SessionQueryWorker(request, cancellation, self.widget)
+        worker.checkpoint_requested.connect(lambda value: entered.set(), Qt.ConnectionType.DirectConnection)
+        worker.completed.connect(outcomes.append, Qt.ConnectionType.DirectConnection)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3), "Indexing did not request a GUI acknowledgement")
+            self.assertFalse(worker.continuation.is_set())
+            cancellation.set()
+            self.assertTrue(worker.wait(1000), "Cancellation depended on a GUI acknowledgement")
+            self.assertEqual(len(outcomes), 1)
+            outcome = outcomes[0]
+            if not isinstance(outcome, session_view._JobOutcome):
+                raise AssertionError("Indexing returned an invalid completion outcome")
+            self.assertIsInstance(outcome.error, SessionCancelled)
+            self.assertIsNone(outcome.index)
+            self.assertIsNone(outcome.page)
+        finally:
+            cancellation.set()
+            self.assertTrue(worker.wait(5000), "The owned indexing worker did not finish")
+            worker.deleteLater()
+
+    def test_index_worker_reports_an_unacknowledged_gui_deadline(self) -> None:
+        request = session_view._JobRequest(1, None, self.report, "a" * 64, session_view.EMPTY_SESSION_QUERY, None, None, None, None)
+        outcomes: list[object] = []
+        cancellation = Event()
+        worker = session_view._SessionQueryWorker(request, cancellation, self.widget)
+        worker.completed.connect(outcomes.append, Qt.ConnectionType.DirectConnection)
+        worker.start()
+        try:
+            wait_until(lambda: not worker.isRunning(), 10000)
+            self.assertEqual(len(outcomes), 1)
+            outcome = outcomes[0]
+            if not isinstance(outcome, session_view._JobOutcome):
+                raise AssertionError("Indexing returned an invalid completion outcome")
+            self.assertIsInstance(outcome.error, session_view.SessionValidationError)
+            self.assertIn("within five seconds", str(outcome.error))
+            self.assertIsNone(outcome.index)
+            self.assertIsNone(outcome.page)
+        finally:
+            cancellation.set()
+            self.assertTrue(worker.wait(5000), "The owned indexing worker did not finish")
+            worker.deleteLater()
+
     def test_legacy_reports_have_explicitly_unavailable_session_evidence(self) -> None:
         self.load()
         self.widget.table.selectRow(0)
