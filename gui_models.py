@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import re
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Mapping, cast
 
 from analyze import epoch_iso
+from analysis_observations import PacketObservationCancelled, summarize_packet_observations
 from packet_models import PCAPNG_PROCESS_FIELDS, PacketRecord, PacketTimestamp, PacketValidationError, estimated_packet_bytes, validate_packet_document
 from captured_dns import CapturedDnsEvidence, CapturedDnsValidationError, CapturedDnsCancelled, validate_dns_evidence_document
 from saved_capture import OPTIONAL_FIELDS, PROTOCOL_FIELDS, REQUIRED_FIELDS
@@ -302,7 +304,7 @@ def load_report_cancellable(path: Path, cancellation: threading.Event) -> Analys
         except CapturedDnsValidationError as error:
             raise ReportValidationError(f"Structured DNS report evidence is invalid: {error}") from error
     check_report_cancellation(cancellation)
-    return AnalysisReport(
+    report = AnalysisReport(
         capture=capture,
         summary=summary,
         endpoints=parse_ranked_findings(
@@ -327,6 +329,100 @@ def load_report_cancellable(path: Path, cancellation: threading.Event) -> Analys
         packets=packets,
         dns_evidence=dns_evidence,
     )
+    for endpoint in report.endpoints:
+        check_report_cancellation(cancellation)
+        validate_endpoint_address(endpoint.value, "top_endpoints")
+    for endpoint in new_endpoints:
+        check_report_cancellation(cancellation)
+        validate_endpoint_address(endpoint, "summary.new_endpoints")
+    if evidence is not None:
+        validate_report_observations(root, report, cancellation)
+    check_report_cancellation(cancellation)
+    return report
+
+
+def validate_endpoint_address(value: str, field: str) -> None:
+    """Reject addresses that would fail endpoint population, including legacy data."""
+    if len(value) > 45 or "%" in value:
+        raise ReportValidationError(f"{field} contains an oversized or zone-qualified IP address.")
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as error:
+        raise ReportValidationError(f"{field} contains an invalid IP address.") from error
+
+
+def validate_ranked_observations(value: object, field: str, expected: tuple[tuple[str, int], ...],
+                                 cancellation: threading.Event) -> None:
+    rows = require_list(value, field)
+    if len(rows) != len(expected):
+        raise ReportValidationError(f"{field} must contain the complete ranked packet observations.")
+    for index, (row_value, observation) in enumerate(zip(rows, expected)):
+        check_report_cancellation(cancellation)
+        row = require_list(row_value, f"{field}[{index}]")
+        if len(row) != 2:
+            raise ReportValidationError(f"{field}[{index}] must contain exactly two values.")
+        actual = (require_string(row[0], field), require_integer(row[1], field))
+        if actual != observation:
+            raise ReportValidationError(f"{field}[{index}] does not match ranked packet observations; values, counts and order must agree without duplicate rows.")
+
+
+def validate_report_observations(root: Mapping[str, object], report: AnalysisReport,
+                                 cancellation: threading.Event) -> None:
+    """Bind every v2 aggregate to packet occurrences, without inferring a baseline.
+
+    Current analyzer exports retain complete rankings, regardless of the CLI's
+    display limit. New values can be any unique observed subset because a saved
+    report does not contain the comparison baseline. Entropy scores are heuristic;
+    their domains must occur in the observed DNS questions.
+    """
+    try:
+        observations = summarize_packet_observations(report.packets, cancellation)
+    except PacketObservationCancelled as error:
+        raise ReportLoadCancelled("Report packet observation validation was cancelled.") from error
+    summary = report.summary
+    for field, actual, expected in (
+        ("unique_endpoints", summary.unique_endpoints, len(observations.endpoints)),
+        ("unique_dns_queries", summary.unique_dns_queries, len(observations.domains)),
+        ("unique_tls_sni", summary.unique_tls_sni, len(observations.tls_sni)),
+        ("quic_like_packets", summary.quic_like_packets, observations.quic_like_packets),
+    ):
+        if actual != expected:
+            raise ReportValidationError(f"summary.{field} does not match packet observations.")
+    for field, ranked in (
+        ("top_endpoints", observations.endpoints), ("top_domains", observations.domains),
+        ("top_tls_sni", observations.tls_sni), ("top_protocols", observations.protocols),
+        ("top_ports", observations.ports),
+    ):
+        validate_ranked_observations(require_field(root, field, "report"), field, ranked, cancellation)
+    field = "top_transport_ports"
+    rows = require_list(require_field(root, field, "report"), field)
+    if len(rows) != len(observations.transport_ports):
+        raise ReportValidationError(f"{field} must contain the complete ranked packet observations.")
+    for index, (row_value, expected_port) in enumerate(zip(rows, observations.transport_ports)):
+        check_report_cancellation(cancellation)
+        row = require_list(row_value, f"{field}[{index}]")
+        if len(row) != 3:
+            raise ReportValidationError(f"{field}[{index}] must contain exactly three values.")
+        actual_port = (require_string(row[0], field), require_string(row[1], field), require_integer(row[2], field))
+        if actual_port != expected_port:
+            raise ReportValidationError(f"{field}[{index}] does not match ranked packet observations; values, counts and order must agree without duplicate rows.")
+    summary_data = require_mapping(require_field(root, "summary", "report"), "summary")
+    for field, values, ranked in (
+        ("new_endpoints", summary.new_endpoints, observations.endpoints),
+        ("new_domains", summary.new_domains, observations.domains),
+        ("new_tls_sni", summary.new_tls_sni, observations.tls_sni),
+    ):
+        check_report_cancellation(cancellation)
+        rows = require_list(require_field(summary_data, field, "summary"), f"summary.{field}")
+        if len(rows) != len(values):
+            raise ReportValidationError(f"summary.{field} must not contain duplicate values.")
+        if not values.issubset(value for value, _count in ranked):
+            raise ReportValidationError(f"summary.{field} contains values absent from packet observations.")
+    observed_domains = frozenset(domain for domain, _count in observations.domains)
+    for finding in report.entropy_findings:
+        check_report_cancellation(cancellation)
+        if finding.domain not in observed_domains:
+            raise ReportValidationError("dns_entropy_findings contains a domain absent from packet observations.")
 
 
 def require_mapping(value: object, field: str) -> Mapping[str, object]:

@@ -63,7 +63,7 @@ class DnsGuiIntegrationTests(unittest.TestCase):
         self.exports = self.directory / "exports"
 
     def saved_report(self, container: Literal["pcap", "pcapng"]) -> tuple[AnalysisReport, Path, bytes]:
-        capture = self.directory / ("dns-evidence." + container)
+        capture = self.directory / ("dns-evidence-" + container + "." + container)
         content = dns_capture(container)
         capture.write_bytes(content)
         document = analyze(capture, load_baseline(self.baseline), 3.8)
@@ -345,7 +345,7 @@ class DnsGuiIntegrationTests(unittest.TestCase):
 
     def test_application_quit_finishes_actual_owned_dns_query(self) -> None:
         self.saved_report("pcapng")
-        report_path = self.exports / "dns-evidence_report.json"
+        report_path = self.exports / "dns-evidence-pcapng_report.json"
         script = """
 from pathlib import Path
 import sys

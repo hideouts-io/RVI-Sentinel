@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from threading import Event
+from time import monotonic
 from typing import Callable, Iterator
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QThread, Qt, Signal, Slot
@@ -22,7 +23,7 @@ from packet_models import ProcessMetadata
 from packet_sessions import (
     EMPTY_SESSION_QUERY, SessionIdentity, SessionIndex, SessionPage, SessionQuery,
     SessionCancelled, SessionValidationError, SessionRecord,
-    build_session_index, query_sessions, session_for_identity, validate_session_query,
+    session_index_steps, query_sessions, session_for_identity, validate_session_query,
 )
 from packet_timeline import PacketQueryCancelled, PacketQueryValidationError, build_packet_index
 from dns_sessions import DnsSessionIndex, DnsSessionCancelled, DnsSessionValidationError, build_dns_session_index, dns_association_count_for_session
@@ -207,19 +208,47 @@ class _SessionQueryWorker(QThread):
     """Owned Qt thread connector that returns after pure indexing/query work."""
 
     completed = Signal(object)
+    checkpoint_requested = Signal(object)
 
     def __init__(self, request: _JobRequest, cancellation: Event, parent: QObject) -> None:
         super().__init__(parent)
         self.request = request
         self.cancellation = cancellation
+        self.continuation = Event()
+
+    def _build_index(self) -> SessionIndex:
+        """Let the GUI service native paint/accessibility between bounded batches."""
+        packets = build_packet_index(self.request.sha256, self.request.report.packets, self.cancellation)
+        for result in session_index_steps(packets, self.cancellation):
+            if result is not None:
+                return result
+            self._main_loop_checkpoint()
+        raise SessionValidationError("Session correlation ended without a complete index.")
+
+    def _main_loop_checkpoint(self) -> None:
+        """Await an owned GUI acknowledgement, with cancellation and a 5s deadline.
+
+        Python's GIL is released while waiting. Merely yielding the worker can
+        immediately reacquire it during native widget painting. A queued
+        acknowledgement requires GUI event-loop progress before the next batch.
+        """
+        self.continuation.clear()
+        deadline = monotonic() + 5.0
+        self.checkpoint_requested.emit(self.continuation)
+        while not self.continuation.wait(0.05):
+            if self.cancellation.is_set():
+                raise SessionCancelled("Session indexing was cancelled while awaiting the GUI.")
+            if monotonic() >= deadline:
+                raise SessionValidationError("The GUI did not acknowledge session indexing within five seconds. The previous completed page is unchanged.")
+        if self.cancellation.is_set():
+            raise SessionCancelled("Session indexing was cancelled while awaiting the GUI.")
 
     @Slot()
     def run(self) -> None:
         try:
             index = self.request.index
             if index is None:
-                packet_index = build_packet_index(self.request.sha256, self.request.report.packets, self.cancellation)
-                index = build_session_index(packet_index, self.cancellation)
+                index = self._build_index()
             dns_index = self.request.dns_index
             if dns_index is None and self.request.report.dns_evidence is not None:
                 dns_index = build_dns_session_index(index, self.request.report.dns_evidence, self.cancellation)
@@ -589,10 +618,17 @@ class SessionTimelineWidget(QWidget):
         thread = _SessionQueryWorker(request, cancellation, self)
         thread.setObjectName("sessionQueryThread")
         thread.completed.connect(self._job_completed, Qt.ConnectionType.QueuedConnection)
+        thread.checkpoint_requested.connect(self._acknowledge_checkpoint, Qt.ConnectionType.QueuedConnection)
         thread.finished.connect(self._thread_finished, Qt.ConnectionType.QueuedConnection)
         self._thread = thread
         self.busy_changed.emit(True)
         thread.start()
+
+    @Slot(object)
+    def _acknowledge_checkpoint(self, value: object) -> None:
+        if not isinstance(value, Event):
+            raise TypeError("Session indexing requires an owned checkpoint event.")
+        value.set()
 
     @Slot(object)
     def _job_completed(self, value: object) -> None:

@@ -489,7 +489,8 @@ class RviSentinelWindow(QMainWindow):
         self.enrichment_status_label = QLabel("Local endpoint context appears after analysis; PTR is not requested.")
 
         self.endpoints_table = create_endpoint_table()
-        self.domains_table = create_ranked_table(("DNS name", "Queries", "Baseline"))
+        self.domains_table = create_ranked_table(("DNS name", "Question observations", "Baseline"))
+        self.domains_table.setToolTip("Counts decoded DNS question-name field occurrences. Responses can repeat questions; these are not request counts.")
         self.tls_table = create_ranked_table(("TLS SNI", "Observations", "Baseline"))
         self.protocols_table = create_ranked_table(("Protocol", "Packets", "Baseline"))
         self.ports_table = create_port_table()
@@ -2909,9 +2910,10 @@ def create_ranked_table(headers: tuple[str, str, str]) -> QTableWidget:
 def create_endpoint_table() -> QTableWidget:
     table = QTableWidget(0, 6)
     table.setHorizontalHeaderLabels(
-        ("Endpoint", "Hostname (PTR)", "Network scope", "Approximate location", "Packets", "Baseline")
+        ("Endpoint", "Hostname (PTR)", "Network scope", "Approximate location", "Address observations", "Baseline")
     )
     table.setAccessibleName("Endpoint findings with PTR and local GeoIP enrichment")
+    table.setToolTip("Counts decoded source/destination IP address field occurrences, including repeated network layers; these are not distinct packet counts.")
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setAlternatingRowColors(True)
@@ -3081,6 +3083,10 @@ def build_findings_explanation(report: AnalysisReport) -> str:
         f"It observed {summary.unique_endpoints:,} unique IP endpoints, "
         f"{summary.unique_dns_queries:,} visible DNS names, and "
         f"{summary.unique_tls_sni:,} visible TLS SNI hostnames.\n\n"
+        "COUNT SCOPE\n"
+        "Endpoint totals count source/destination IP address field observations, including repeated network layers. "
+        "DNS totals count question-name field observations, including questions repeated in replies. "
+        "Neither is a count of connections or client DNS requests. Inspect Packets and DNS evidence for the supporting records.\n\n"
         "BASELINE CHANGES\n"
         f"{new_endpoint_count:,} endpoints, {new_domain_count:,} DNS names, and "
         f"{new_tls_count:,} TLS SNI names were absent from the selected baseline. "

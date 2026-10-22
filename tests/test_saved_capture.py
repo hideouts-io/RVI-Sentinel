@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
 import os
@@ -361,6 +362,148 @@ class RealSavedCaptureTests(unittest.TestCase):
         self.assertEqual(baseline.read_bytes(), baseline_bytes)
         self.assertFalse(any(exports.glob(".rvi-sentinel-report-*")))
         self.assertFalse(any(self.directory.glob(".rvi-sentinel-baseline-*")))
+
+    def test_same_stem_captures_cannot_replace_another_capture_export_bundle(self) -> None:
+        first_directory = self.directory / "first"
+        second_directory = self.directory / "second"
+        first_directory.mkdir()
+        second_directory.mkdir()
+        first = first_directory / "capture.pcap"
+        second = second_directory / "capture.pcapng"
+        first.write_bytes(classic_capture(3))
+        second.write_bytes(metadata_capture())
+        baseline = self.directory / "baseline.json"
+        original_baseline = load_baseline(baseline)
+        baseline.write_text(json.dumps(original_baseline), encoding="utf-8")
+        baseline_bytes = baseline.read_bytes()
+        first_bytes, second_bytes = first.read_bytes(), second.read_bytes()
+        exports = self.directory / "exports"
+        first_report = analyze(first, original_baseline, 3.5)
+        save_report(first_report, first, exports, (first, baseline), threading.Event())
+        before = {path.name: path.read_bytes() for path in exports.iterdir()}
+        second_report = analyze(second, original_baseline, 3.5)
+
+        with self.assertRaises(SavedCaptureError) as failure:
+            save_report(second_report, second, exports, (second, baseline), threading.Event())
+
+        self.assertEqual(failure.exception.code, "export_capture_collision")
+        self.assertEqual({path.name: path.read_bytes() for path in exports.iterdir()}, before)
+        self.assertEqual(baseline.read_bytes(), baseline_bytes)
+        self.assertEqual((first.read_bytes(), second.read_bytes()), (first_bytes, second_bytes))
+        for script in ("analyze.py", "analyze_preview.py", "analyze_reviewed.py"):
+            arguments = [sys.executable, script, str(second), "--baseline", str(baseline),
+                         "--export-dir", str(exports), "--entropy-threshold", "3.5", "--top", "0"]
+            if script == "analyze_reviewed.py":
+                arguments.extend(("--expected-sha256", second_report["capture"]["sha256"]))
+            completed = subprocess.run(arguments, cwd=Path(__file__).resolve().parents[1],
+                                       capture_output=True, text=True, check=False, timeout=20)
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("different capture", completed.stderr)
+            self.assertEqual({path.name: path.read_bytes() for path in exports.iterdir()}, before)
+            self.assertEqual(baseline.read_bytes(), baseline_bytes)
+        save_report(first_report, first, exports, (first, baseline), threading.Event())
+        self.assertEqual({path.name: path.read_bytes() for path in exports.iterdir()}, before)
+
+    def test_unclaimed_export_files_are_preserved_with_an_actionable_failure(self) -> None:
+        capture = self.directory / "unclaimed.pcapng"
+        capture.write_bytes(metadata_capture())
+        report = analyze(capture, load_baseline(self.directory / "baseline.json"), 3.5)
+        exports = self.directory / "exports"
+        exports.mkdir()
+        earlier = exports / "unclaimed_dns.csv"
+        earlier.write_bytes(b"earlier investigation output\n")
+
+        with self.assertRaises(SavedCaptureError) as failure:
+            save_report(report, capture, exports, (capture,), threading.Event())
+
+        self.assertEqual(failure.exception.code, "unclaimed_export_bundle")
+        self.assertIn("separate export directory", str(failure.exception))
+        self.assertEqual(tuple(exports.iterdir()), (earlier,))
+        self.assertEqual(earlier.read_bytes(), b"earlier investigation output\n")
+
+    def test_export_receipt_rejects_links_and_invalid_contents_without_replacing_outputs(self) -> None:
+        capture = self.directory / "receipt.pcapng"
+        capture.write_bytes(metadata_capture())
+        report = analyze(capture, load_baseline(self.directory / "baseline.json"), 3.5)
+        exports = self.directory / "exports"
+        save_report(report, capture, exports, (capture,), threading.Event())
+        receipt = exports / "receipt_capture.sha256"
+        self.assertEqual(receipt.read_text(encoding="ascii"), report["capture"]["sha256"] + "\n")
+        outputs = {path: path.read_bytes() for path in exports.iterdir() if path != receipt}
+        receipt.write_bytes(b"invalid ownership receipt\n")
+        with self.assertRaises(SavedCaptureError) as failure:
+            save_report(report, capture, exports, (capture,), threading.Event())
+        self.assertEqual(failure.exception.code, "invalid_export_receipt")
+        self.assertEqual({path: path.read_bytes() for path in outputs}, outputs)
+        receipt.unlink()
+        target = self.directory / "unrelated-receipt.txt"
+        target.write_text(report["capture"]["sha256"] + "\n", encoding="ascii")
+        receipt.symlink_to(target)
+        with self.assertRaises(SavedCaptureError):
+            save_report(report, capture, exports, (capture,), threading.Event())
+        self.assertEqual({path: path.read_bytes() for path in outputs}, outputs)
+        self.assertEqual(target.read_text(encoding="ascii"), report["capture"]["sha256"] + "\n")
+
+    def test_export_headers_describe_field_observations_without_changing_history_counts(self) -> None:
+        capture = self.directory / "observations.pcapng"
+        capture.write_bytes(metadata_capture())
+        report = analyze(capture, load_baseline(self.directory / "baseline.json"), 3.5)
+        exports = self.directory / "exports"
+        save_report(report, capture, exports, (capture,), threading.Event())
+        for suffix, expected, values in (
+            ("endpoints", ["endpoint", "address_observations"], report["top_endpoints"]),
+            ("dns", ["domain", "question_observations"], report["top_domains"]),
+        ):
+            with (exports / ("observations_" + suffix + ".csv")).open(newline="", encoding="utf-8") as stream:
+                rows = tuple(csv.reader(stream))
+            self.assertEqual(rows[0], expected)
+            self.assertEqual(tuple((row[0], int(row[1])) for row in rows[1:]), tuple(values))
+
+    @unittest.skipIf(os.name == "nt", "The real child file-size limit requires POSIX resource limits.")
+    def test_receipt_staging_file_size_failure_leaves_no_claim_and_retry_succeeds(self) -> None:
+        capture = self.directory / "receipt-retry.pcapng"
+        capture.write_bytes(metadata_capture())
+        exports = self.directory / "exports"
+        source = """
+import errno
+import resource
+import signal
+import sys
+import threading
+from pathlib import Path
+from unittest.mock import patch
+import analyze
+
+capture, exports = (Path(value) for value in sys.argv[1:])
+report = analyze.analyze(capture, analyze.load_baseline(exports.parent / 'absent-baseline.json'), 3.5)
+prepare = analyze.prepare_export_receipt
+
+def limited_receipt(path: Path, digest: str) -> None:
+    previous = resource.getrlimit(resource.RLIMIT_FSIZE)
+    handler = signal.getsignal(signal.SIGXFSZ)
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (32, previous[1]))
+    try:
+        prepare(path, digest)
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, previous)
+        signal.signal(signal.SIGXFSZ, handler)
+
+with patch('analyze.prepare_export_receipt', limited_receipt):
+    try:
+        analyze.save_report(report, capture, exports, (capture,), threading.Event())
+    except OSError as error:
+        assert error.errno == errno.EFBIG, error
+    else:
+        raise AssertionError('Receipt staging must fail at the real kernel file-size limit')
+assert tuple(exports.iterdir()) == (), 'No partial receipt or staged files may remain'
+analyze.save_report(report, capture, exports, (capture,), threading.Event())
+assert (exports / 'receipt-retry_capture.sha256').read_text(encoding='ascii') == report['capture']['sha256'] + '\\n'
+"""
+        completed = subprocess.run([sys.executable, "-c", source, str(capture), str(exports)],
+                                   cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                                   text=True, check=False, timeout=20)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_reviewed_update_rejects_changed_or_replaced_capture_without_publication(self) -> None:
         capture = self.directory / "reviewed.pcapng"

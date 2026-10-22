@@ -6,6 +6,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -14,6 +15,8 @@ from typing import Literal, Mapping, TypedDict, cast
 
 import maxminddb
 from maxminddb.reader import Reader
+
+from ptr_lookup import query_ptr_hostname
 
 
 @dataclass(frozen=True)
@@ -181,20 +184,10 @@ def classify_address(address: str) -> str:
 
 
 def reverse_hostname(address: str, attempts: int) -> tuple[str, str]:
-    last_error: socket.gaierror | None = None
-    for attempt in range(attempts):
-        try:
-            hostname, _aliases, _addresses = socket.gethostbyaddr(address)
-            return hostname.rstrip("."), "PTR record returned by the configured DNS resolver"
-        except socket.herror:
-            return "No PTR record", "Reverse DNS returned no hostname"
-        except socket.gaierror as error:
-            last_error = error
-            if attempt + 1 == attempts:
-                break
-    if last_error is None:
-        raise ValueError("Reverse DNS attempts must be at least one.")
-    return "Lookup failed", f"Reverse DNS failed after {attempts} attempts: {last_error}"
+    """Bound each explicitly requested current-resolver lookup to five seconds."""
+
+    command = (sys.executable, str(Path(__file__).with_name("ptr_lookup.py")))
+    return query_ptr_hostname(command, address, attempts, 5.0)
 
 
 def enrich_endpoints(
