@@ -283,6 +283,8 @@ Geolocation is deliberately local-only: RVI-Sentinel never sends captured endpoi
 
 IP geolocation is approximate. It often represents a network or nearby population center and must not be interpreted as the exact location of a device, person, or household. Saved-file analysis and automatic local GeoIP enrichment perform no PTR lookup. Choose **Resolve current PTR names** to query the host's configured DNS resolver explicitly; request/completion times and the result source are shown separately from captured DNS/SNI. PTR names may be absent, generic, stale, shared, or controlled by a hosting provider. **Cancel lookup** stops the current enrichment process; results do not alter the capture, report or baseline.
 
+Each requested address has a five-second resolver wait budget, followed by at most two seconds for owned process cleanup. **Lookup timed out** means the configured resolver did not answer in that interval; it does not establish that a PTR record is absent. The timed-out helper is stopped and reaped before its result is returned; incomplete cleanup fails explicitly. Process creation and operating-system termination are not hard real-time guarantees. Cancelling the enrichment owner also closes its private pipe so blocked lookup helpers exit. At most 16 address lookups run concurrently, and the existing 30-second GUI limit bounds the complete request.
+
 ### Guided capture receipts and timing
 
 Schema-v1 receipts carry a request nonce, exact selected output path, requested format/duration, recording outcome, full-file validation, artifact digest/count/timestamps, independent process/interface cleanup states, and distinct failure codes. The GUI rejects stale, malformed, duplicate, or missing receipts and does not infer successful capture or teardown from helper exit or file existence. A zero-length decoded frame is retained as readable frame evidence; it does not count as positive captured traffic.
@@ -820,6 +822,7 @@ RVI-Sentinel/
 ├── capture_receipt.py         # final typed outcomes and strict GUI boundary
 ├── capture_stats.py           # complete streaming artifact validation
 ├── enrich_endpoints.py        # explicitly requested current PTR process
+├── ptr_lookup.py              # owned resolver process and five-second deadline
 ├── local_endpoint_enrichment.py # passive scope and local GeoIP process
 ├── finding_enrichment.py      # address, location, and port explanations
 ├── gui.py                     # PySide6 capture and analysis desktop UI

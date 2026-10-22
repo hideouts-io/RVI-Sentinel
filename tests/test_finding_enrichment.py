@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+from ptr_lookup import parse_lookup_output, query_ptr_hostname
 
 from finding_enrichment import (
     classify_address,
@@ -25,7 +30,97 @@ from finding_enrichment import (
 REPO = Path(__file__).resolve().parents[1]
 
 
+def verify_ptr_process_boundary() -> None:
+    """Use actual child processes to exercise the deadline, reaping and owner-pipe cancellation."""
+
+    with tempfile.TemporaryDirectory(prefix="rvi-ptr-process-") as temporary:
+        marker = Path(temporary) / "worker.pid"
+        blocking_helper = """
+import os
+from pathlib import Path
+import sys
+from threading import Event
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')
+Event().wait()
+"""
+        started = time.monotonic()
+        result = query_ptr_hostname((sys.executable, "-c", blocking_helper, str(marker)), "127.0.0.1", 2, 5.0)
+        elapsed = time.monotonic() - started
+        assert result[0] == "Lookup timed out", result
+        assert "5 seconds" in result[1] and "no hostname was established" in result[1], result
+        assert 5.0 <= elapsed < 8.0, f"Five-second PTR deadline/cleanup took {elapsed:.3f}s"
+        worker_pid = int(marker.read_text(encoding="ascii"))
+        if os.name == "posix":
+            try:
+                os.waitpid(worker_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            else:
+                raise AssertionError("Timed-out owned PTR helper was not reaped")
+
+    ownership_driver = """
+import subprocess
+import sys
+helper = '''
+from threading import Event, Thread
+from ptr_lookup import exit_when_owner_closes
+Thread(target=exit_when_owner_closes, daemon=True).start()
+print('ready', flush=True)
+Event().wait()
+'''
+with subprocess.Popen([sys.executable, '-c', helper], stdin=subprocess.PIPE,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+    try:
+        assert process.stdout.readline().strip() == 'ready'
+        process.stdin.close()
+        assert process.wait(timeout=2) == 125
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+print('PASS owner pipe closure stops an actual blocked child')
+"""
+    ownership = subprocess.run([sys.executable, "-c", ownership_driver], cwd=REPO,
+                               text=True, capture_output=True, timeout=10, check=False)
+    assert ownership.returncode == 0, ownership.stdout + ownership.stderr
+    assert "PASS owner pipe closure" in ownership.stdout
+
+    for helper, expected in (("raise SystemExit(7)", "code 7"),
+                             ("print('{}')", "exactly address"),
+                             ("import os; os.write(1, b'x' * 65536)", "stdout exceeded 4096 bytes"),
+                             ("import os; os.write(2, b'x' * 65536)", "stderr exceeded 4096 bytes")):
+        try:
+            query_ptr_hostname((sys.executable, "-c", helper), "127.0.0.1", 2, 5.0)
+        except (OSError, ValueError) as error:
+            assert expected in str(error), error
+        else:
+            raise AssertionError("PTR helper failure or malformed output was accepted")
+
+    resolved = {"address": "127.0.0.1", "status": "resolved", "hostname": "localhost", "error_code": None}
+    assert parse_lookup_output(json.dumps(resolved), "127.0.0.1")[0] == "localhost"
+    no_record = {**resolved, "status": "no_record", "hostname": None, "error_code": 1}
+    assert parse_lookup_output(json.dumps(no_record), "127.0.0.1")[0] == "No PTR record"
+    failed = {**resolved, "status": "failed", "hostname": None, "error_code": 3}
+    assert parse_lookup_output(json.dumps(failed), "127.0.0.1")[0] == "Lookup failed"
+    for invalid in (
+        {**resolved, "address": "192.0.2.1"},
+        {**resolved, "extra": "untrusted"},
+        {**resolved, "hostname": ""},
+        {**resolved, "hostname": "localhost\nextra"},
+        {**resolved, "error_code": True},
+        {**resolved, "status": "no_record"},
+        {**no_record, "error_code": 2},
+    ):
+        try:
+            parse_lookup_output(json.dumps(invalid), "127.0.0.1")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid PTR helper output was accepted")
+
+
 def main() -> None:
+    verify_ptr_process_boundary()
     assert classify_address("127.0.0.1") == "Loopback"
     assert classify_address("10.0.0.1") == "Private/local"
     assert classify_address("100.64.0.1") == "Carrier-grade NAT"
@@ -139,6 +234,10 @@ def main() -> None:
     print("PASS: passive endpoint enrichment never invokes the resolver")
     print("PASS: separate local and explicit PTR CLI evidence with timezone-aware timestamps")
     print("PASS: invalid endpoint, evidence source, and timestamp rejection")
+    print("PASS: five-second PTR deadline kills and reaps an actual blocked helper")
+    print("PASS: owner-pipe closure cancels an actual blocked helper")
+    print("PASS: PTR helper exit, schema and address-binding failures remain explicit")
+    print("PASS: helper stdout/stderr overflow fails explicitly without becoming a DNS timeout")
 
 
 if __name__ == "__main__":
