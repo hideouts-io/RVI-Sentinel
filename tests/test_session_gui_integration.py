@@ -382,9 +382,9 @@ template = load_report(Path(sys.argv[1]))
 records = diverse_session_records(100_000)
 report = timeline_report(template, records, hashlib.sha256(b'owned session quit corpus').hexdigest())
 window.show()
-window.populate_report(report)
 
 def quit_with_actual_workers():
+    window.populate_report(report)
     if not window.session_timeline.is_busy or not window.packet_timeline.is_busy:
         print('Expected both actual session and packet workers before quit.', flush=True)
         application.exit(4)
